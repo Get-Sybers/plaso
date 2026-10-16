@@ -76,7 +76,7 @@ class FishHistoryParser(interface.FileObjectParser):
         file_size = file_object.get_size()
         if file_size > self._MAXIMUM_FISH_HISTORY_FILE_SIZE:
             parser_mediator.ProduceWarning(
-                f"Fish history file size: {file_size:d} exceeds maxmimum"
+                f"Fish history file size: {file_size:d} exceeds maximum"
             )
             return
 
@@ -92,7 +92,7 @@ class FishHistoryParser(interface.FileObjectParser):
 
         for entry_index, history_entry in enumerate(fish_history):
             date_time = None
-            corrupted = True
+            corrupted = False
 
             timestamp = history_entry.get("when")
             if timestamp is None:

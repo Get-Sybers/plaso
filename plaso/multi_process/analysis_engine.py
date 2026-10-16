@@ -50,6 +50,12 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
         if worker_memory_limit is None:
             worker_memory_limit = definitions.DEFAULT_WORKER_MEMORY_LIMIT
 
+        if worker_timeout:
+            # The worker timeout is specified in minutes.
+            worker_timeout *= 60.0
+        else:
+            worker_timeout = definitions.DEFAULT_WORKER_TIMEOUT
+
         super().__init__()
         self._analysis_plugins = {}
         self._completed_analysis_processes = set()
@@ -77,7 +83,7 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
         self._status_update_callback = None
         self._user_accounts = None
         self._worker_memory_limit = worker_memory_limit
-        self._worker_timeout = worker_timeout or definitions.DEFAULT_WORKER_TIMEOUT
+        self._worker_timeout = worker_timeout
 
     def _AnalyzeEvents(self, storage_writer, analysis_plugins, event_filter=None):
         """Analyzes events in a Plaso storage.
@@ -128,7 +134,7 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
                 event_data_stream = None
 
             event_identifier = event.GetIdentifier()
-            event_tag = storage_writer.GetEventTagByEventIdentifer(event_identifier)
+            event_tag = storage_writer.GetEventTagByEventIdentifier(event_identifier)
 
             if event_filter:
                 filter_match = event_filter.Match(
@@ -144,12 +150,12 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
 
             for event_queue in self._event_queues.values():
                 # TODO: Check for premature exit of analysis plugins.
-                event_tripple = events.EventTripple()
-                event_tripple.event = event
-                event_tripple.event_data = event_data
-                event_tripple.event_data_stream = event_data_stream
+                event_triple = events.EventTriple()
+                event_triple.event = event
+                event_triple.event_data = event_data
+                event_triple.event_data_stream = event_data_stream
 
-                event_queue.PushItem(event_tripple)
+                event_queue.PushItem(event_triple)
 
             self._number_of_consumed_events += 1
 
@@ -653,6 +659,7 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
 
         self._event_labels_counter = collections.Counter()
 
+        total_number_of_events = 0
         if storage_writer.HasAttributeContainers("parser_count"):
             parsers_counter = {
                 parser_count.name: parser_count.number_of_events
@@ -661,11 +668,6 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
                 )
             }
             total_number_of_events = parsers_counter["total"]
-
-        else:
-            total_number_of_events = 0
-            for stored_session in storage_writer.GetSessions():
-                total_number_of_events += stored_session.parsers_counter["total"]
 
         self._events_status.total_number_of_events = total_number_of_events
 
@@ -715,7 +717,7 @@ class AnalysisMultiProcessEngine(task_engine.TaskMultiProcessEngine):
 
             self._StopProfiling()
 
-        # Update the status view one last time before the analysis processses are
+        # Update the status view one last time before the analysis processes are
         # stopped.
         self._UpdateStatus()
 

@@ -14,20 +14,28 @@ login
   data_type is 'linux:utmp:event' AND login_type == 7
   data_type is 'selinux:line' AND audit_type is 'LOGIN'
   reporter is 'login' AND (message_body contains 'logged in' OR message_body contains 'ROOT LOGIN' OR message_body contains 'session opened')
-  reporter is 'sshd' AND (message_body contains 'session opened' OR message_body contains 'Starting session')
+  (reporter is 'sshd' OR reporter is 'sshd-session') AND (message_body contains 'session opened' OR message_body contains 'Starting session')
   reporter is 'dovecot' AND message_body contains 'imap-login: Login:'
   reporter is 'postfix/submission/smtpd' AND message_body contains 'sasl_'
+  data_type is 'syslog:ssh:login'
+  data_type is 'selinux:line' AND audit_type is 'USER_LOGIN' AND operation_result == 1
+  data_type is 'vsftpd:log' AND text contains 'OK LOGIN'
 
 # Tags Linux failed log-in events.
 login_failed
   data_type is 'selinux:line' AND audit_type is 'ANOM_LOGIN_FAILURES'
-  data_type is 'selinux:line' AND audit_type is 'USER_LOGIN' AND message_body contains 'res=failed'
+  data_type is 'selinux:line' AND audit_type is 'USER_LOGIN' AND operation_result == 0
   data_type is 'syslog:line' AND message_body contains 'pam_tally2'
-  (reporter is 'sshd' OR reporter is 'login' OR reporter is 'postfix/submission/smtpd' OR reporter is 'sudo') AND message_body contains 'uthentication fail'
-  reporter is 'sshd' AND (message_body contains 'Access denied for user' OR message_body contains 'not allowed because')
+  (reporter is 'sshd' OR reporter is 'sshd-session' OR reporter is 'login' OR reporter is 'postfix/submission/smtpd' OR reporter is 'sudo') AND message_body contains 'uthentication fail'
+  (reporter is 'sshd' OR reporter is 'sshd-session') AND (message_body contains 'Access denied for user' OR message_body contains 'not allowed because')
   (reporter is 'xscreensaver' or reporter is 'login') AND message_body contains 'FAILED LOGIN'
   reporter is 'su' and message_body contains 'DENIED'
   reporter is 'nologin'
+  data_type is 'syslog:ssh:failed_connection'
+  data_type is 'syslog:ssh:invalid_user'
+  data_type is 'selinux:line' AND audit_type is 'USER_AUTH' AND operation_result == 0
+  reporter is 'su' AND message_body contains 'FAILED SU'
+  data_type is 'vsftpd:log' AND text contains 'FAIL LOGIN'
 
 # User added.
 useradd
@@ -60,18 +68,21 @@ logout
   # This will also flag dead gettys that init kills during shutdown/reboot (at least with SysV init)
   data_type is 'linux:utmp:event' AND login_type == 8 AND terminal != '' AND pid != 0
   reporter is 'login' AND message_body contains 'session closed'
-  reporter is 'sshd' AND (message_body contains 'session closed' OR message_body contains 'Close session')
+  (reporter is 'sshd' OR reporter is 'sshd-session') AND (message_body contains 'session closed' OR message_body contains 'Close session')
   reporter is 'systemd-logind' AND message_body contains 'logged out'
   reporter is 'dovecot' AND message_body contains 'Logged out'
   data_type is 'selinux:line' AND audit_type is 'USER_LOGOUT'
+  data_type is 'syslog:ssh:closed_connection' AND is_authenticated == 1
 
 # Tags Linux user session start events.
 session_start
   reporter is 'systemd-logind' AND message_body contains 'New session'
+  data_type is 'selinux:line' AND audit_type is 'USER_START'
 
 # Tags Linux user session stop events.
 session_stop
   reporter is 'systemd-logind' AND message_body contains 'Removed session'
+  data_type is 'selinux:line' AND audit_type is 'USER_END'
 
 # Tags Linux system boot events.
 boot
@@ -82,6 +93,7 @@ boot
 shutdown
   data_type is 'linux:utmp:event' AND login_type == 1 AND (terminal is '~~' OR terminal is 'system boot') AND username is 'shutdown'
   data_type is 'selinux:line' AND audit_type is 'SYSTEM_SHUTDOWN'
+  reporter is 'systemd-logind' AND (message_body contains 'System is powering down' OR message_body contains 'System is rebooting' OR message_body contains 'System is halting')
 
 # Tags Linux system run level change events.
 runlevel
@@ -99,6 +111,7 @@ device_disconnection
 # Tags Linux application installation events.
 application_install
   data_type is 'linux:dpkg_log:entry' AND message_body contains 'status installed'
+  data_type is 'linux:apt_history_log:entry' AND command is 'Install'
 
 # Tags Linux service start events.
 service_start
@@ -108,7 +121,7 @@ service_start
 service_stop
   data_type is 'selinux:line' AND audit_type is 'SERVICE_STOP'
 
-# Tags Linux network promiscious mode change events.
+# Tags Linux network promiscuous mode change events.
 promiscuous
   data_type is 'selinux:line' AND audit_type is 'ANOM_PROMISCUOUS'
   reporter is 'kernel' AND message_body contains 'promiscuous mode'

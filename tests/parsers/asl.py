@@ -204,6 +204,64 @@ class ASLParserTest(test_lib.ParserTestCase):
         )
         self.assertEqual(number_of_warnings, 0)
 
+    def testParseFileObjectSelfReferencingRecordChain(self):
+        """Tests the ParseFileObject function on a self-referencing record chain."""
+        parser = asl.ASLParser()
+
+        file_header_data = self._CreateFileHeaderData(parser)
+
+        # Build a single record whose next record offset points back to the start
+        # of the record chain (offset 80), which forms a chain that refers back to
+        # itself. A data size of 92 results in no additional record data.
+        record_map = parser._GetDataTypeMap("asl_record")
+        record = record_map.CreateStructureValues(
+            unknown1=0,
+            data_size=92,
+            next_record_offset=80,
+            message_identifier=0,
+            written_time=0,
+            written_time_nanoseconds=0,
+            alert_level=0,
+            flags=0,
+            process_identifier=0,
+            user_identifier=0,
+            group_identifier=0,
+            read_user_identifier=0,
+            read_group_identifier=0,
+            reference_process_identifier=0,
+            hostname_string_offset=0,
+            sender_string_offset=0,
+            facility_string_offset=0,
+            message_string_offset=0,
+        )
+        record_data = record_map.FoldByteStream(record)
+
+        storage_writer = self._CreateStorageWriter()
+        parser_mediator = self._CreateParserMediator(storage_writer)
+
+        file_object = self._CreateFileObject(
+            "asl", b"".join([file_header_data, record_data])
+        )
+
+        # Parsing must terminate rather than follow the self-referencing chain
+        # without end.
+        parser.ParseFileObject(parser_mediator, file_object)
+
+        number_of_event_data = storage_writer.GetNumberOfAttributeContainers(
+            "event_data"
+        )
+        self.assertEqual(number_of_event_data, 1)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "extraction_warning"
+        )
+        self.assertEqual(number_of_warnings, 1)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "recovery_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
     def testParse(self):
         """Tests the Parse function."""
         parser = asl.ASLParser()
@@ -233,6 +291,7 @@ class ASLParserTest(test_lib.ParserTestCase):
         event_data = storage_writer.GetAttributeContainerByIndex("event_data", 2)
         self.CheckEventData(event_data, expected_event_values)
 
+        # typos:disable
         # Note that "compatiblity" is spelt incorrectly in the actual message being
         # tested here.
         expected_event_values = {
@@ -260,10 +319,12 @@ class ASLParserTest(test_lib.ParserTestCase):
             "user_identifier": 205,
             "written_time": "2013-11-25T09:45:35.705481000+00:00",
         }
+        # typos:enable
         event_data = storage_writer.GetAttributeContainerByIndex("event_data", 0)
         self.CheckEventData(event_data, expected_event_values)
 
         # Check a second event data to ensure record strings are parsed correctly.
+        # typos:disable
         expected_event_values = {
             "data_type": "macos:asl:entry",
             "extra_information": (
@@ -289,6 +350,7 @@ class ASLParserTest(test_lib.ParserTestCase):
             "user_identifier": 205,
             "written_time": "2013-11-25T17:12:43.571140000+00:00",
         }
+        # typos:enable
         event_data = storage_writer.GetAttributeContainerByIndex("event_data", 1)
         self.CheckEventData(event_data, expected_event_values)
 

@@ -4,14 +4,17 @@
 import unittest
 
 from plaso.containers import events
+from plaso.engine import tagging_file
 from plaso.lib import definitions
 from plaso.parsers import fish_history
 from plaso.parsers import utmp
 from plaso.parsers.jsonl_plugins import docker_layer_config
+from plaso.parsers.text_plugins import apt_history
 from plaso.parsers.text_plugins import bash_history
 from plaso.parsers.text_plugins import dpkg
 from plaso.parsers.text_plugins import selinux
 from plaso.parsers.text_plugins import syslog
+from plaso.parsers.text_plugins import vsftpd
 from plaso.parsers.text_plugins import zsh_extended_history
 
 from tests.data import test_lib
@@ -122,11 +125,12 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             syslog.SyslogLineEventData, attribute_values_per_name, ["login"]
         )
 
-        # Test: reporter is 'sshd' AND (message_body contains 'session opened' OR
+        # Test: (reporter is 'sshd' OR reporter is 'sshd-session') AND
+        #       (message_body contains 'session opened' OR
         #       message_body contains 'Starting session')
         attribute_values_per_name = {
             "message_body": ["session opened", "Starting session"],
-            "reporter": ["sshd"],
+            "reporter": ["sshd", "sshd-session"],
         }
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["login"]
@@ -150,6 +154,27 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             syslog.SyslogLineEventData, attribute_values_per_name, ["login"]
         )
 
+        # Test: data_type is 'syslog:ssh:login'
+        self._CheckTaggingRule(syslog.SyslogSSHLoginEventData, {}, ["login"])
+
+        # Test: data_type is 'selinux:line' AND audit_type is 'USER_LOGIN' AND
+        #       operation_result == 1
+        attribute_values_per_name = {
+            "audit_type": ["USER_LOGIN"],
+            "operation_result": [True],
+        }
+        self._CheckTaggingRule(
+            selinux.SELinuxLogEventData, attribute_values_per_name, ["login"]
+        )
+
+        # Test: data_type is 'vsftpd:log' AND text contains 'OK LOGIN'
+        attribute_values_per_name = {
+            "text": ['[svc-backup] OK LOGIN: Client "192.168.1.62"']
+        }
+        self._CheckTaggingRule(
+            vsftpd.VsftpdLogEventData, attribute_values_per_name, ["login"]
+        )
+
     def testRuleLoginFailed(self):
         """Tests the login_failed tagging rule."""
         # Test: data_type is 'selinux:line' AND audit_type is 'ANOM_LOGIN_FAILURES'
@@ -159,10 +184,10 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         )
 
         # Test: data_type is 'selinux:line' AND audit_type is 'USER_LOGIN' AND
-        #       message_body contains 'res=failed'
+        #       operation_result == 0
         attribute_values_per_name = {
             "audit_type": ["USER_LOGIN"],
-            "message_body": ["res=failed"],
+            "operation_result": [False],
         }
         self._CheckTaggingRule(
             selinux.SELinuxLogEventData, attribute_values_per_name, ["login_failed"]
@@ -175,6 +200,7 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         )
 
         # Test: (reporter is 'sshd' OR
+        #        reporter is 'sshd-session' OR
         #        reporter is 'login' OR
         #        reporter is 'postfix/submission/smtpd' OR
         #        reporter is 'sudo') AND
@@ -185,7 +211,24 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
                 "authentication failure",
                 "Authentication failure",
             ],
-            "reporter": ["login", "postfix/submission/smtpd", "sshd", "sudo"],
+            "reporter": [
+                "login",
+                "postfix/submission/smtpd",
+                "sshd",
+                "sshd-session",
+                "sudo",
+            ],
+        }
+        self._CheckTaggingRule(
+            syslog.SyslogLineEventData, attribute_values_per_name, ["login_failed"]
+        )
+
+        # Test: (reporter is 'sshd' OR reporter is 'sshd-session') AND
+        #       (message_body contains 'Access denied for user' OR
+        #       message_body contains 'not allowed because')
+        attribute_values_per_name = {
+            "message_body": ["Access denied for user", "not allowed because"],
+            "reporter": ["sshd", "sshd-session"],
         }
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["login_failed"]
@@ -215,6 +258,43 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         attribute_values_per_name = {"reporter": ["nologin"]}
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["login_failed"]
+        )
+
+        # Test: data_type is 'syslog:ssh:failed_connection'
+        self._CheckTaggingRule(
+            syslog.SyslogSSHFailedConnectionEventData, {}, ["login_failed"]
+        )
+
+        # Test: data_type is 'syslog:ssh:invalid_user'
+        self._CheckTaggingRule(
+            syslog.SyslogSSHInvalidUserEventData, {}, ["login_failed"]
+        )
+
+        # Test: data_type is 'selinux:line' AND audit_type is 'USER_AUTH' AND
+        #       operation_result == 0
+        attribute_values_per_name = {
+            "audit_type": ["USER_AUTH"],
+            "operation_result": [False],
+        }
+        self._CheckTaggingRule(
+            selinux.SELinuxLogEventData, attribute_values_per_name, ["login_failed"]
+        )
+
+        # Test: reporter is 'su' AND message_body contains 'FAILED SU'
+        attribute_values_per_name = {
+            "message_body": ["FAILED SU (to root) ubuntu on pts/0"],
+            "reporter": ["su"],
+        }
+        self._CheckTaggingRule(
+            syslog.SyslogLineEventData, attribute_values_per_name, ["login_failed"]
+        )
+
+        # Test: data_type is 'vsftpd:log' AND text contains 'FAIL LOGIN'
+        attribute_values_per_name = {
+            "text": ['[svc-backup] FAIL LOGIN: Client "192.168.1.62"']
+        }
+        self._CheckTaggingRule(
+            vsftpd.VsftpdLogEventData, attribute_values_per_name, ["login_failed"]
         )
 
     def testRuleUserAdd(self):
@@ -355,11 +435,12 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             syslog.SyslogLineEventData, attribute_values_per_name, ["logout"]
         )
 
-        # Test: reporter is 'sshd' AND (message_body contains 'session closed' OR
+        # Test: (reporter is 'sshd' OR reporter is 'sshd-session') AND
+        #       (message_body contains 'session closed' OR
         #       message_body contains 'Close session')
         attribute_values_per_name = {
             "message_body": ["Close session", "session closed"],
-            "reporter": ["sshd"],
+            "reporter": ["sshd", "sshd-session"],
         }
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["logout"]
@@ -389,6 +470,14 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             selinux.SELinuxLogEventData, attribute_values_per_name, ["logout"]
         )
 
+        # Test: data_type is 'syslog:ssh:closed_connection' AND is_authenticated == 1
+        attribute_values_per_name = {"is_authenticated": [True]}
+        self._CheckTaggingRule(
+            syslog.SyslogSSHClosedConnectionEventData,
+            attribute_values_per_name,
+            ["logout"],
+        )
+
     def testRuleSessionStart(self):
         """Tests the session_start tagging rule."""
         # Test: reporter is 'systemd-logind' and message_body contains 'New session'
@@ -400,6 +489,12 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             syslog.SyslogLineEventData, attribute_values_per_name, ["session_start"]
         )
 
+        # Test: data_type is 'selinux:line' AND audit_type is 'USER_START'
+        attribute_values_per_name = {"audit_type": ["USER_START"]}
+        self._CheckTaggingRule(
+            selinux.SELinuxLogEventData, attribute_values_per_name, ["session_start"]
+        )
+
     def testRuleSessionStop(self):
         """Tests the session_stop tagging rule."""
         # Test: reporter is 'systemd-logind' and message_body contains 'Removed session'
@@ -409,6 +504,12 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         }
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["session_stop"]
+        )
+
+        # Test: data_type is 'selinux:line' AND audit_type is 'USER_END'
+        attribute_values_per_name = {"audit_type": ["USER_END"]}
+        self._CheckTaggingRule(
+            selinux.SELinuxLogEventData, attribute_values_per_name, ["session_stop"]
         )
 
     def testRuleBoot(self):
@@ -446,6 +547,22 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         attribute_values_per_name = {"audit_type": ["SYSTEM_SHUTDOWN"]}
         self._CheckTaggingRule(
             selinux.SELinuxLogEventData, attribute_values_per_name, ["shutdown"]
+        )
+
+        # Test: reporter is 'systemd-logind' AND
+        #       (message_body contains 'System is powering down' OR
+        #        message_body contains 'System is rebooting' OR
+        #        message_body contains 'System is halting')
+        attribute_values_per_name = {
+            "message_body": [
+                "System is powering down.",
+                "System is rebooting.",
+                "System is halting.",
+            ],
+            "reporter": ["systemd-logind"],
+        }
+        self._CheckTaggingRule(
+            syslog.SyslogLineEventData, attribute_values_per_name, ["shutdown"]
         )
 
     def testRuleRunlevel(self):
@@ -496,6 +613,14 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             dpkg.DpkgEventData, attribute_values_per_name, ["application_install"]
         )
 
+        # Test: data_type is 'linux:apt_history_log:entry' AND command is 'Install'
+        attribute_values_per_name = {"command": ["Install"]}
+        self._CheckTaggingRule(
+            apt_history.APTHistoryLogEventData,
+            attribute_values_per_name,
+            ["application_install"],
+        )
+
     def testRuleServiceStart(self):
         """Tests the service_start tagging rule."""
         # Test: data_type is 'selinux:line' AND audit_type is 'SERVICE_START'
@@ -529,7 +654,7 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
             syslog.SyslogLineEventData, attribute_values_per_name, ["promiscuous"]
         )
 
-    def testRuleCrach(self):
+    def testRuleCrash(self):
         """Tests the crash tagging rule."""
         # Test: data_type is 'selinux:line' AND audit_type is 'ANOM_ABEND'
         attribute_values_per_name = {"audit_type": ["ANOM_ABEND"]}
@@ -545,6 +670,16 @@ class LinuxTaggingFileTest(test_lib.TaggingFileTestCase):
         self._CheckTaggingRule(
             syslog.SyslogLineEventData, attribute_values_per_name, ["crash"]
         )
+
+    def testValidate(self):
+        """Tests the Validate function on the tagging file."""
+        tag_file_path = self._GetDataFilePath([self._TAG_FILE])
+        self._SkipIfPathNotExists(tag_file_path)
+
+        tag_file = tagging_file.TaggingFile(tag_file_path)
+
+        findings = tag_file.Validate()
+        self.assertEqual(findings, [])
 
 
 if __name__ == "__main__":

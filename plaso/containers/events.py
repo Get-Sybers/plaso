@@ -9,13 +9,56 @@ from acstore.containers import manager
 from dfdatetime import interface as dfdatetime_interface
 
 
-def CalculateEventValuesHash(event_data, event_data_stream):
+def CalculateEventDataStreamHashAttributes(event_data_stream):
+    """Calculates the event data stream portion of the event values hash.
+
+    The returned strings are byte-identical for every event data that shares
+    the same event data stream, so they can be calculated once and reused.
+
+    Args:
+      event_data_stream (EventDataStream): event data stream.
+
+    Returns:
+      list[str]: event data stream attribute strings used to calculate the
+          event values hash.
+
+    Raises:
+      RuntimeError: if the event values hash cannot be determined.
+    """
+    attributes = []
+
+    for attribute_name, attribute_value in sorted(event_data_stream.GetAttributes()):
+        if attribute_name == "path_spec":
+            attribute_value = attribute_value.comparable
+
+        elif not isinstance(attribute_value, (bool, float, int, list, str)):
+            raise RuntimeError(
+                f"Unsupported attribute: {attribute_name:s} value type: "
+                f"{type(attribute_value)!s}"
+            )
+
+        try:
+            attributes.append(f"{attribute_name:s}: {attribute_value!s}")
+        except UnicodeDecodeError:
+            raise RuntimeError(f"Failed to decode attribute {attribute_name:s}")
+
+    return attributes
+
+
+def CalculateEventValuesHash(
+    event_data, event_data_stream, event_data_stream_attributes=None
+):
     """Calculates a digest hash of the event values.
 
     Args:
       event_data (EventData): event data.
       event_data_stream (EventDataStream): an event data stream or None if not
           available.
+      event_data_stream_attributes (Optional[list[str]]): precomputed event
+          data stream attribute strings, as returned by
+          CalculateEventDataStreamHashAttributes, to reuse across event data
+          that share the same event data stream. If None the strings are
+          calculated from event_data_stream.
 
     Returns:
       str: digest hash of the event values content.
@@ -27,9 +70,11 @@ def CalculateEventValuesHash(event_data, event_data_stream):
 
     for attribute_name, attribute_value in sorted(event_data.GetAttributes()):
         if attribute_value is None or attribute_name in (
+            "_corrupted",
             "_event_data_stream_identifier",
             "_event_values_hash",
             "_parser_chain",
+            "_recovered",
             "data_type",
         ):
             continue
@@ -57,22 +102,12 @@ def CalculateEventValuesHash(event_data, event_data_stream):
             raise RuntimeError(f"Failed to decode attribute {attribute_name:s}")
 
     if event_data_stream:
-        for attribute_name, attribute_value in sorted(
-            event_data_stream.GetAttributes()
-        ):
-            if attribute_name == "path_spec":
-                attribute_value = attribute_value.comparable
+        if event_data_stream_attributes is None:
+            event_data_stream_attributes = CalculateEventDataStreamHashAttributes(
+                event_data_stream
+            )
 
-            elif not isinstance(attribute_value, (bool, float, int, list, str)):
-                raise RuntimeError(
-                    f"Unsupported attribute: {attribute_name:s} value type: "
-                    f"{type(attribute_value)!s}"
-                )
-
-            try:
-                attributes.append(f"{attribute_name:s}: {attribute_value!s}")
-            except UnicodeDecodeError:
-                raise RuntimeError(f"Failed to decode attribute {attribute_name:s}")
+        attributes.extend(event_data_stream_attributes)
 
     content = ", ".join(attributes)
     content_data = content.encode("utf-8")
@@ -205,9 +240,11 @@ class EventData(interface.AttributeContainer):
     }
 
     _SERIALIZABLE_PROTECTED_ATTRIBUTES = [
+        "_corrupted",
         "_event_data_stream_identifier",
         "_event_values_hash",
         "_parser_chain",
+        "_recovered",
     ]
 
     def __init__(self, data_type=None):
@@ -499,8 +536,8 @@ class EventTag(interface.AttributeContainer):
         self._event_identifier = event_identifier
 
 
-class EventTripple(interface.AttributeContainer):
-    """Event tripple.
+class EventTriple(interface.AttributeContainer):
+    """Event triple.
 
     Attributes:
       event (EventObject): event.
@@ -508,10 +545,10 @@ class EventTripple(interface.AttributeContainer):
       event_data_stream (EventDataStream): event data stream.
     """
 
-    CONTAINER_TYPE = "event_tripple"
+    CONTAINER_TYPE = "event_triple"
 
     def __init__(self):
-        """Initializes an event tripple."""
+        """Initializes an event triple."""
         super().__init__()
         self.event = None
         self.event_data = None
@@ -525,6 +562,6 @@ manager.AttributeContainersManager.RegisterAttributeContainers(
         EventDataStream,
         EventObject,
         EventTag,
-        EventTripple,
+        EventTriple,
     ]
 )

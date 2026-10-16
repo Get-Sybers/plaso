@@ -65,7 +65,7 @@ class SpotlightStoreMetadataItemEventData(events.EventData):
       purchase_time  (dfdatetime.DateTimeValues): date and time the item was
           purchased in the AppStore (kMDItemAppStorePurchaseDate).
       snapshot_times (list[dfdatetime.DateTimeValues]): dates and times of
-          the creation of backup snaphots (_kTimeMachineOldestSnapshot and
+          the creation of backup snapshots (_kTimeMachineOldestSnapshot and
           _kTimeMachineNewestSnapshot).
       update_time (dfdatetime.DateTimeValues): date and time the item was last
           updated.
@@ -862,6 +862,16 @@ class SpotlightStoreDatabaseParser(
         page_header, page_header_size = self._ReadStructureFromFileObject(
             file_object, file_offset, data_type_map
         )
+
+        # A page size smaller than the page header does not advance the map
+        # offset in _ReadMapPages, which would prevent the map pages from being
+        # read to completion.
+        if page_header.page_size < page_header_size:
+            raise errors.ParseError(
+                f"Invalid map page size: {page_header.page_size:d} smaller than "
+                f"page header size: {page_header_size:d}"
+            )
+
         file_offset += page_header_size
 
         self._ReadMapPageValues(page_header, file_object, file_offset)
@@ -1109,7 +1119,7 @@ class SpotlightStoreDatabaseParser(
         return value, bytes_read
 
     def _ReadMetadataAttributePageValues(self, page_header, page_data, property_table):
-        """Reads the metadata atribute page values.
+        """Reads the metadata attribute page values.
 
         Args:
           page_header (spotlight_store_db_property_page_header): page header.
@@ -1391,12 +1401,22 @@ class SpotlightStoreDatabaseParser(
         Raises:
           ParseError: if the property pages cannot be read.
         """
+        visited_block_numbers = set()
         file_offset = block_number * 0x1000
         while file_offset != 0:
-            _, next_block_number = self._ReadPropertyPage(
+            # A property page that refers back to a block that was already read
+            # would prevent the property pages from being read to completion.
+            if block_number in visited_block_numbers:
+                raise errors.ParseError(
+                    f"Invalid property page block number: {block_number:d} "
+                    f"already read"
+                )
+            visited_block_numbers.add(block_number)
+
+            _, block_number = self._ReadPropertyPage(
                 file_object, file_offset, property_table
             )
-            file_offset = next_block_number * 0x1000
+            file_offset = block_number * 0x1000
 
     def _ReadRecordHeader(self, data, page_data_offset):
         """Reads a record header.

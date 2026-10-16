@@ -126,6 +126,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
         super().__init__()
         # The export event heap is used to make sure the events are sorted in
         # a deterministic way.
+        self._event_tags = None
         self._events_status = processing_status.EventsStatus()
         self._export_event_heap = PsortEventHeap()
         self._export_event_timestamp = 0
@@ -252,6 +253,8 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
         # duplicate events have been discarded.
         resolve_event_tag = event_filter is None
 
+        self._event_tags = None
+
         time_slice_buffer = None
         time_slice_range = None
 
@@ -286,8 +289,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
 
             event_tag = None
             if not resolve_event_tag:
-                event_identifier = event.GetIdentifier()
-                event_tag = storage_reader.GetEventTagByEventIdentifer(event_identifier)
+                event_tag = self._GetEventTag(storage_reader, event)
 
             if time_slice_range and event.timestamp != time_slice.event_timestamp:
                 self._events_status.number_of_events_from_time_slice += 1
@@ -305,7 +307,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                     self._events_status.number_of_filtered_events += 1
 
                 elif forward_entries == 0:
-                    time_slice_buffer.Append((event, event_data))
+                    time_slice_buffer.Append((event, event_data, event_data_stream))
                     self._events_status.number_of_filtered_events += 1
 
                 elif forward_entries <= time_slice_buffer.size:
@@ -336,12 +338,13 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                     for (
                         event_in_buffer,
                         event_data_in_buffer,
+                        event_data_stream_in_buffer,
                     ) in time_slice_buffer.Flush():
                         event_tag_in_buffer = None
                         if not resolve_event_tag:
                             event_identifier = event_in_buffer.GetIdentifier()
                             event_tag_in_buffer = (
-                                storage_reader.GetEventTagByEventIdentifer(
+                                storage_reader.GetEventTagByEventIdentifier(
                                     event_identifier
                                 )
                             )
@@ -351,7 +354,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                             output_module,
                             event_in_buffer,
                             event_data_in_buffer,
-                            event_data_stream,
+                            event_data_stream_in_buffer,
                             event_tag=event_tag_in_buffer,
                             deduplicate_events=deduplicate_events,
                             resolve_event_tag=resolve_event_tag,
@@ -427,8 +430,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                 continue
 
             if resolve_event_tag:
-                event_identifier = event.GetIdentifier()
-                event_tag = storage_reader.GetEventTagByEventIdentifer(event_identifier)
+                event_tag = self._GetEventTag(storage_reader, event)
 
             if timestamp_desc in (
                 definitions.TIME_DESCRIPTION_LAST_ACCESS,
@@ -477,6 +479,27 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
 
         if macb_group:
             output_module.WriteFieldValuesOfMACBGroup(self._output_mediator, macb_group)
+
+    def _GetEventTag(self, storage_reader, event):
+        """Retrieves the event tag of an event.
+
+        The event tags are read from the storage once and cached, instead of
+        querying the storage for every event.
+
+        Args:
+          storage_reader (StorageReader): storage reader.
+          event (EventObject): event.
+
+        Returns:
+          EventTag: event tag or None if the event has no event tag.
+        """
+        if self._event_tags is None:
+            self._event_tags = {}
+            for event_tag in storage_reader.GetAttributeContainers("event_tag"):
+                lookup_key = event_tag.GetEventIdentifier().CopyToString()
+                self._event_tags.setdefault(lookup_key, event_tag)
+
+        return self._event_tags.get(event.GetIdentifier().CopyToString())
 
     def _ReadMessageFormatters(
         self, output_mediator_object, data_location, custom_formatters_path

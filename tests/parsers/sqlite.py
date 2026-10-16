@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Tests for the SQLite database parser."""
 
+import io
+import os
+import sqlite3
+import stat
+import sys
+import tempfile
 import unittest
 
 from plaso.parsers import sqlite
@@ -38,6 +44,28 @@ class SQLiteDatabaseTest(test_lib.ParserTestCase):
             database.Open(database_file_object)
             database.Close()
 
+    def testOpenCloseOnDatabaseWithDoubleQuoteInTableName(self):
+        """Tests Open and Close on a database with a double quote in a table name."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_file_path = os.path.join(temporary_directory, "events.db")
+
+            connection = sqlite3.connect(database_file_path)
+            connection.execute('CREATE TABLE "events""log" (field1 INTEGER)')
+            connection.commit()
+            connection.close()
+
+            with open(database_file_path, "rb") as file_object:
+                database_file_object = io.BytesIO(file_object.read())
+
+        database = sqlite.SQLiteDatabase("events.db")
+        database.Open(database_file_object)
+
+        try:
+            self.assertIn('events"log', database.tables)
+            self.assertEqual(database.columns_per_table['events"log'], ["field1"])
+        finally:
+            database.Close()
+
     def testQueryOnDatabaseWithWAL(self):
         """Tests the Query function on a database with a WAL file."""
         database_file_path = self._GetTestFilePath(["wal_database.db"])
@@ -69,6 +97,37 @@ class SQLiteDatabaseTest(test_lib.ParserTestCase):
             ("New Text 2", 13, None),
         ]
         self.assertEqual(expected_results, row_results)
+
+    @unittest.skipIf(
+        sys.platform.startswith("win"),
+        "POSIX file mode bits are not meaningful on Windows.",
+    )
+    def testOpenWithWALRestrictsTemporaryFileMode(self):
+        """Tests that the temporary WAL copy is created with mode 0600."""
+        database_file_path = self._GetTestFilePath(["wal_database.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database_wal_file_path = self._GetTestFilePath(["wal_database.db-wal"])
+        self._SkipIfPathNotExists(database_wal_file_path)
+
+        database = sqlite.SQLiteDatabase("wal_database.db")
+
+        # Force a permissive umask so the assertion exercises the explicit mode
+        # instead of whatever the environment happens to mask off.
+        original_umask = os.umask(0o022)
+        try:
+            with open(database_file_path, "rb") as database_file_object:
+                with open(database_wal_file_path, "rb") as wal_file_object:
+                    database.Open(database_file_object, wal_file_object=wal_file_object)
+
+            # pylint: disable=protected-access
+            temporary_wal_file_path = database._temp_wal_file_path
+            # pylint: enable=protected-access
+            mode = stat.S_IMODE(os.stat(temporary_wal_file_path).st_mode)
+            self.assertEqual(0o600, mode)
+        finally:
+            os.umask(original_umask)
+            database.Close()
 
     def testQueryOnDatabaseWithoutWAL(self):
         """Tests the Query function on a database without a WAL file."""

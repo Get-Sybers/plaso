@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the task-based multi-process processing analysis engine."""
 
+import multiprocessing
 import os
 import shutil
+import time
 import unittest
 
 from plaso.analysis import tagging
@@ -47,7 +49,6 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
             storage_writer = storage_factory.StorageFactory.CreateStorageWriter(
                 definitions.DEFAULT_STORAGE_FORMAT
             )
-
             test_engine._processing_configuration = configuration
             test_engine._session = session
 
@@ -104,7 +105,6 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
             storage_writer = storage_factory.StorageFactory.CreateStorageWriter(
                 definitions.DEFAULT_STORAGE_FORMAT
             )
-
             storage_writer.Open(path=temp_file)
 
             try:
@@ -121,11 +121,56 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
                     configuration,
                     storage_file_path=temp_directory,
                 )
-
                 number_of_reports = storage_writer.GetNumberOfAttributeContainers(
                     "analysis_report"
                 )
                 self.assertEqual(number_of_reports, 3)
+
+            finally:
+                storage_writer.Close()
+
+    def testAnalyzeEventsWithoutParserCount(self):
+        """Tests the AnalyzeEvents function on a storage file without counts."""
+        test_tagging_file_path = self._GetTestFilePath(["tagging_file", "valid.txt"])
+        self._SkipIfPathNotExists(test_tagging_file_path)
+
+        session = sessions.Session()
+
+        data_location = ""
+
+        analysis_plugin = tagging.TaggingAnalysisPlugin()
+        analysis_plugin.SetAndLoadTagFile(test_tagging_file_path)
+
+        analysis_plugins = {"tagging": analysis_plugin}
+
+        configuration = configurations.ProcessingConfiguration()
+        test_engine = analysis_engine.AnalysisMultiProcessEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+
+            storage_writer = storage_factory.StorageFactory.CreateStorageWriter(
+                definitions.DEFAULT_STORAGE_FORMAT
+            )
+            storage_writer.Open(path=temp_file)
+
+            try:
+                # A storage file of an extraction that generated no events has no
+                # parser count attribute containers.
+                storage_writer.AddAttributeContainer(session)
+
+                has_parser_count = storage_writer.HasAttributeContainers("parser_count")
+                self.assertFalse(has_parser_count)
+
+                test_engine.AnalyzeEvents(
+                    session,
+                    storage_writer,
+                    data_location,
+                    analysis_plugins,
+                    configuration,
+                    storage_file_path=temp_directory,
+                )
+                self.assertEqual(test_engine._events_status.total_number_of_events, 0)
 
             finally:
                 storage_writer.Close()
@@ -158,7 +203,6 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
             storage_writer = storage_factory.StorageFactory.CreateStorageWriter(
                 definitions.DEFAULT_STORAGE_FORMAT
             )
-
             storage_writer.Open(path=temp_file)
 
             try:
@@ -176,7 +220,6 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
                     event_filter=test_filter,
                     storage_file_path=temp_directory,
                 )
-
                 number_of_reports = storage_writer.GetNumberOfAttributeContainers(
                     "analysis_report"
                 )
@@ -184,6 +227,35 @@ class AnalysisEngineMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
 
             finally:
                 storage_writer.Close()
+
+    def testInternalUpdateProcessingStatus(self):
+        """Tests the _UpdateProcessingStatus function."""
+        # The worker timeout is specified in minutes.
+        test_engine = analysis_engine.AnalysisMultiProcessEngine(worker_timeout=5.0)
+
+        process = multiprocessing.Process(name="Worker_00")
+        test_engine._processes_per_pid[1] = process
+        test_engine._process_information_per_pid[1] = None
+
+        process_status = {
+            "last_activity_timestamp": time.time() - 60.0,
+            "processing_status": definitions.STATUS_INDICATOR_RUNNING,
+        }
+        test_engine._UpdateProcessingStatus(1, process_status, 0)
+
+        worker_status = test_engine._processing_status.workers_status[0]
+        self.assertEqual(worker_status.status, definitions.STATUS_INDICATOR_RUNNING)
+
+        process_status = {
+            "last_activity_timestamp": time.time() - 600.0,
+            "processing_status": definitions.STATUS_INDICATOR_RUNNING,
+        }
+        test_engine._UpdateProcessingStatus(1, process_status, 0)
+
+        worker_status = test_engine._processing_status.workers_status[0]
+        self.assertEqual(
+            worker_status.status, definitions.STATUS_INDICATOR_NOT_RESPONDING
+        )
 
     # TODO: add bogus data location test.
 

@@ -297,7 +297,7 @@ class NSKeyedArchiverDecoder:
 
         if value_plist_uid in parent_objects:
             raise RuntimeError(
-                (f"{class_name:s}.$1 wth UID: {value_plist_uid:d} in parent objects")
+                f"{class_name:s}.$1 with UID: {value_plist_uid:d} in parent objects"
             )
 
         referenced_property = objects_array[value_plist_uid]
@@ -886,6 +886,9 @@ class PlistPlugin(plugins.BasePlugin):
         Returns:
           bool: True if this is the correct plugin, False otherwise.
         """
+        if not isinstance(top_level, dict):
+            return False
+
         return set(top_level.keys()).issuperset(self.PLIST_KEYS)
 
     def Process(self, parser_mediator, top_level=None, **kwargs):
