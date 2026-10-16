@@ -5,6 +5,8 @@
 package dfpath
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
@@ -58,4 +60,37 @@ func (p *PathSpec) DisplayName() string {
 		return p.Parent.DisplayName()
 	}
 	return "-"
+}
+
+// Comparable mirrors dfVFS PathSpec.comparable: one "type: X, key: value\n" line
+// per path specification in the chain (parent first), with the comparable
+// attributes sorted by name. This covers the flat OS/location case exercised by
+// psort's native output; the attribute set matches dfVFS for those specs.
+func (p *PathSpec) Comparable() string {
+	if p == nil {
+		return ""
+	}
+	var b strings.Builder
+	if p.Parent != nil {
+		b.WriteString(p.Parent.Comparable())
+	}
+	b.WriteString("type: ")
+	b.WriteString(p.TypeIndicator)
+	keys := make([]string, 0, len(p.raw))
+	for k := range p.raw {
+		switch k {
+		case "parent", "type_indicator", "__type__":
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		b.WriteString(", ")
+		b.WriteString(k)
+		b.WriteString(": ")
+		b.WriteString(fmt.Sprintf("%v", p.raw[k]))
+	}
+	b.WriteByte('\n')
+	return b.String()
 }

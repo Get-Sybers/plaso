@@ -23,11 +23,27 @@ var (
 	formattersDir = filepath.Join(repoRoot, "plaso", "data", "formatters")
 )
 
-func export(t *testing.T, mode pipeline.Mode, dedup bool) []byte {
-	return exportW(t, mode, dedup, 0)
+// moduleCase describes one output module and its golden fixtures.
+type moduleCase struct {
+	name     string                                 // psort -o NAME
+	factory  func(*mediator.Mediator) output.Module // Go module under test
+	dedup    string                                 // golden file for deduplicated output ("" = no golden)
+	all      string                                 // golden file for -a output ("" = no golden)
+	noGolden bool                                   // module produces no output (null)
 }
 
-func exportW(t *testing.T, mode pipeline.Mode, dedup bool, workers int) []byte {
+func modules() []moduleCase {
+	return []moduleCase{
+		{name: "dynamic", factory: func(m *mediator.Mediator) output.Module { return output.NewDynamic(m) }, dedup: "dynamic.csv", all: "dynamic_all.csv"},
+		{name: "l2tcsv", factory: func(m *mediator.Mediator) output.Module { return output.NewL2TCSV(m) }, dedup: "l2tcsv.csv", all: "l2tcsv_all.csv"},
+		{name: "tln", factory: func(m *mediator.Mediator) output.Module { return output.NewTLN(m) }, dedup: "tln.txt", all: "tln_all.txt"},
+		{name: "l2ttln", factory: func(m *mediator.Mediator) output.Module { return output.NewL2TTLN(m) }, dedup: "l2ttln.txt", all: "l2ttln_all.txt"},
+		{name: "rawpy", factory: func(m *mediator.Mediator) output.Module { return output.NewRawpy(m) }, dedup: "rawpy.txt", all: "rawpy_all.txt"},
+		{name: "null", factory: func(m *mediator.Mediator) output.Module { return output.NewNull() }, noGolden: true},
+	}
+}
+
+func export(t *testing.T, factory func(*mediator.Mediator) output.Module, dedup bool, workers int) []byte {
 	t.Helper()
 	fset := formatters.NewSet()
 	if err := fset.LoadDir(formattersDir); err != nil {
@@ -41,8 +57,7 @@ func exportW(t *testing.T, mode pipeline.Mode, dedup bool, workers int) []byte {
 
 	exp := &pipeline.Exporter{
 		Reader:  reader,
-		Dynamic: output.NewDynamic(mediator.New(fset)),
-		Mode:    mode,
+		Module:  factory(mediator.New(fset)),
 		Dedup:   dedup,
 		Workers: workers,
 	}
@@ -53,54 +68,66 @@ func exportW(t *testing.T, mode pipeline.Mode, dedup bool, workers int) []byte {
 	return buf.Bytes()
 }
 
-// TestSerialParallelEquivalence asserts the worker count never changes output:
-// serial (1), parallel (4), and heavy oversubscription (16) must all match the
-// deduplicated golden exactly.
+// TestGoldens diffs every module against the committed Python psort fixtures,
+// for both the deduplicated and the include-all (-a) cases.
+func TestGoldens(t *testing.T) {
+	for _, mc := range modules() {
+		mc := mc
+		t.Run(mc.name, func(t *testing.T) {
+			if mc.noGolden {
+				if got := export(t, mc.factory, true, 0); len(got) != 0 {
+					t.Errorf("%s produced %d bytes, want empty", mc.name, len(got))
+				}
+				if got := export(t, mc.factory, false, 0); len(got) != 0 {
+					t.Errorf("%s -a produced %d bytes, want empty", mc.name, len(got))
+				}
+				return
+			}
+			for _, v := range []struct {
+				golden string
+				dedup  bool
+			}{{mc.dedup, true}, {mc.all, false}} {
+				golden, err := os.ReadFile(filepath.Join("testdata", v.golden))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := export(t, mc.factory, v.dedup, 0)
+				if !bytes.Equal(got, golden) {
+					t.Errorf("%s (dedup=%v) differs from golden %s\n%s", mc.name, v.dedup, v.golden, firstDiff(golden, got))
+				}
+			}
+		})
+	}
+}
+
+// TestSerialParallelEquivalence asserts the worker count never changes output.
 func TestSerialParallelEquivalence(t *testing.T) {
-	golden, err := os.ReadFile(filepath.Join("testdata", "dynamic.csv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, workers := range []int{1, 2, 4, 16} {
-		got := exportW(t, pipeline.ModeCSV, true, workers)
-		if !bytes.Equal(got, golden) {
-			t.Errorf("workers=%d differs from golden\n%s", workers, firstDiff(golden, got))
+	for _, mc := range modules() {
+		if mc.noGolden {
+			continue
 		}
+		mc := mc
+		t.Run(mc.name, func(t *testing.T) {
+			base := export(t, mc.factory, true, 1)
+			for _, w := range []int{2, 4, 16} {
+				got := export(t, mc.factory, true, w)
+				if !bytes.Equal(got, base) {
+					t.Errorf("%s workers=%d differs from serial\n%s", mc.name, w, firstDiff(base, got))
+				}
+			}
+		})
 	}
 }
 
-func TestDynamicCSVMatchesGolden(t *testing.T) {
-	golden, err := os.ReadFile(filepath.Join("testdata", "dynamic.csv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := export(t, pipeline.ModeCSV, true)
-	if !bytes.Equal(got, golden) {
-		t.Errorf("dynamic CSV (dedup) differs from Python golden\n%s", firstDiff(golden, got))
-	}
-}
-
-func TestDynamicCSVAllMatchesGolden(t *testing.T) {
-	golden, err := os.ReadFile(filepath.Join("testdata", "dynamic_all.csv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := export(t, pipeline.ModeCSV, false)
-	if !bytes.Equal(got, golden) {
-		t.Errorf("dynamic CSV (include-all) differs from Python golden\n%s", firstDiff(golden, got))
-	}
-}
-
-func TestJSONLDeliverable(t *testing.T) {
-	got := export(t, pipeline.ModeJSONL, true)
+func TestDynamicJSONLDeliverable(t *testing.T) {
+	factory := func(m *mediator.Mediator) output.Module { return output.NewDynamicJSONL(m) }
+	got := export(t, factory, true, 0)
 	lines := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
 	if len(lines) != 20 {
 		t.Fatalf("got %d JSONL rows, want 20", len(lines))
 	}
-
 	wantOrder := output.DynamicFieldNames
 	for i, line := range lines {
-		// Valid JSON object.
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			t.Fatalf("row %d invalid JSON: %v", i, err)
@@ -108,13 +135,10 @@ func TestJSONLDeliverable(t *testing.T) {
 		if len(obj) != len(wantOrder) {
 			t.Errorf("row %d has %d fields, want %d", i, len(obj), len(wantOrder))
 		}
-		// Field key order preserved (JSONL is the dynamic field order).
 		if keys := jsonKeyOrder(line); !equalStrings(keys, wantOrder) {
 			t.Errorf("row %d key order = %v, want %v", i, keys, wantOrder)
 		}
 	}
-
-	// Raw (un-sanitized) message: comma preserved, unlike the CSV form.
 	if !strings.Contains(string(got), "[client, pid: 30840]") {
 		t.Errorf("expected raw comma-containing message in JSONL output")
 	}
@@ -126,27 +150,54 @@ func TestDifferentialAgainstPython(t *testing.T) {
 	if os.Getenv("GOPLASO_PSORT_ORACLE") != "1" {
 		t.Skip("set GOPLASO_PSORT_ORACLE=1 to run the live Python differential test")
 	}
-	tmp := filepath.Join(t.TempDir(), "py.csv")
-	// Paths are relative to cmd.Dir (the repo root).
-	cmd := exec.Command("python3", filepath.Join("plaso", "scripts", "psort.py"),
-		"-o", "dynamic", "-w", tmp, filepath.Join("test_data", "psort_test.plaso"))
+	for _, mc := range modules() {
+		if mc.noGolden {
+			continue
+		}
+		mc := mc
+		for _, dedup := range []bool{true, false} {
+			t.Run(mc.name+dedupSuffix(dedup), func(t *testing.T) {
+				pyOut := runPython(t, mc.name, dedup)
+				got := export(t, mc.factory, dedup, 0)
+				if !bytes.Equal(got, pyOut) {
+					t.Errorf("Go %s (dedup=%v) differs from live Python psort\n%s", mc.name, dedup, firstDiff(pyOut, got))
+				}
+			})
+		}
+	}
+}
+
+func dedupSuffix(dedup bool) string {
+	if dedup {
+		return "/dedup"
+	}
+	return "/all"
+}
+
+func runPython(t *testing.T, module string, dedup bool) []byte {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "py.out")
+	args := []string{filepath.Join("plaso", "scripts", "psort.py"), "-q", "-o", module, "-w", tmp}
+	if !dedup {
+		args = append(args, "-a")
+	}
+	args = append(args, filepath.Join("test_data", "psort_test.plaso"))
+	cmd := exec.Command("python3", args...)
 	cmd.Dir = repoRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("python psort unavailable: %v\n%s", err, out)
 	}
-	pyOut, err := os.ReadFile(tmp)
+	data, err := os.ReadFile(tmp)
 	if err != nil {
-		t.Fatal(err)
+		// null writes no file.
+		return nil
 	}
-	got := export(t, pipeline.ModeCSV, true)
-	if !bytes.Equal(got, pyOut) {
-		t.Errorf("Go output differs from live Python psort\n%s", firstDiff(pyOut, got))
-	}
+	return data
 }
 
 func jsonKeyOrder(line string) []string {
 	dec := json.NewDecoder(strings.NewReader(line))
-	dec.Token() // opening {
+	dec.Token()
 	var keys []string
 	for dec.More() {
 		tok, err := dec.Token()
@@ -155,7 +206,6 @@ func jsonKeyOrder(line string) []string {
 		}
 		if k, ok := tok.(string); ok {
 			keys = append(keys, k)
-			// skip the value
 			var v any
 			_ = dec.Decode(&v)
 		}

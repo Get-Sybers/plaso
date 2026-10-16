@@ -113,17 +113,71 @@ func pyStr(v any) string {
 		return strconv.Itoa(t)
 	case int64:
 		return strconv.FormatInt(t, 10)
+	case []any:
+		return pyReprList(t)
+	case []string:
+		items := make([]any, len(t))
+		for i, s := range t {
+			items[i] = s
+		}
+		return pyReprList(items)
 	default:
 		return fmt.Sprintf("%v", t)
 	}
 }
 
-// pyRepr is a minimal Python repr() for strings/numbers (quotes strings).
+// pyRepr is a minimal Python repr() for the value types that appear in event
+// values (strings, numbers, booleans, lists).
 func pyRepr(v any) string {
-	if s, ok := v.(string); ok {
-		return "'" + strings.ReplaceAll(s, "'", "\\'") + "'"
+	switch t := v.(type) {
+	case string:
+		return pyReprString(t)
+	case []any:
+		return pyReprList(t)
+	default:
+		return pyStr(v)
 	}
-	return pyStr(v)
+}
+
+// pyReprList mirrors Python repr() of a list: "[elem, ...]" with each element
+// rendered via repr (strings single-quoted).
+func pyReprList(items []any) string {
+	parts := make([]string, len(items))
+	for i, e := range items {
+		parts[i] = pyRepr(e)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// pyReprString mirrors Python repr() of a string: single quotes by default,
+// double quotes if the string contains a single but no double quote, with the
+// common escape sequences.
+func pyReprString(s string) string {
+	quote := byte('\'')
+	if strings.Contains(s, "'") && !strings.Contains(s, "\"") {
+		quote = '"'
+	}
+	var b strings.Builder
+	b.WriteByte(quote)
+	for _, r := range s {
+		switch r {
+		case rune(quote):
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '\\':
+			b.WriteString("\\\\")
+		case '\n':
+			b.WriteString("\\n")
+		case '\r':
+			b.WriteString("\\r")
+		case '\t':
+			b.WriteString("\\t")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte(quote)
+	return b.String()
 }
 
 // applySpec applies the Python format spec mini-language subset used by plaso.
