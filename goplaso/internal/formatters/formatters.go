@@ -338,9 +338,27 @@ func pieceAttrNames(pieces []string) ([]string, error) {
 // DefaultMessage reproduces plaso's DefaultEventFormatter output for a data
 // type with no registered formatter.
 func DefaultMessage(values map[string]any) string {
+	return "<WARNING DEFAULT FORMATTER> Attributes: " + defaultAttributeValues(values)
+}
+
+// defaultDataFormatterReserved mirrors DefaultEventFormatter._RESERVED_VARIABLE_NAMES.
+var defaultDataFormatterReserved = map[string]bool{
+	"_corrupted": true, "_event_values_hash": true, "_parser_chain": true,
+	"_recovered": true, "data_type": true, "date_time": true, "path_spec": true,
+	"timestamp": true, "timestamp_desc": true,
+}
+
+// defaultAttributeValues builds the "name: value ..." body of the default
+// formatter, skipping reserved names and date/time values. Python iterates the
+// event values in insertion order; we sort for determinism (a documented
+// simplification — the default formatter is not exercised by the test corpus).
+func defaultAttributeValues(values map[string]any) string {
 	keys := make([]string, 0, len(values))
-	for k := range values {
-		if strings.HasPrefix(k, "_") || k == "data_type" {
+	for k, v := range values {
+		if defaultDataFormatterReserved[k] {
+			continue
+		}
+		if IsDateTimeValue(v) {
 			continue
 		}
 		keys = append(keys, k)
@@ -350,7 +368,21 @@ func DefaultMessage(values map[string]any) string {
 	for _, k := range keys {
 		parts = append(parts, fmt.Sprintf("%s: %s", k, pyStr(values[k])))
 	}
-	return "<WARNING DEFAULT FORMATTER> Attributes: " + strings.Join(parts, " ")
+	return strings.Join(parts, " ")
+}
+
+// IsDateTimeValue reports whether a decoded JSON value is a serialized
+// dfdatetime value (a map carrying "__type__": "DateTimeValues"), or a list
+// whose first element is one.
+func IsDateTimeValue(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		s, _ := t["__type__"].(string)
+		return s == "DateTimeValues"
+	case []any:
+		return len(t) > 0 && IsDateTimeValue(t[0])
+	}
+	return false
 }
 
 // --- YAML value coercion helpers ---
