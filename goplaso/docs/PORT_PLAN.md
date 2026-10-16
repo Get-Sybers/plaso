@@ -261,10 +261,10 @@ Put this in `internal/testutil` as a golden harness that shells out to Python. T
 |---|---|---|---|
 | **M0** | Reader hardening | Finish `plasostore`: metadata gate, schema-vs-blob dispatch, rowid joins, LRU, quoted-printable + typed-value decode; hardcode known schemas | `reader_test.go` dumps every container from `psort_test.plaso`; counts match `pinfo`/Python |
 | **M1** | **First slice: `dynamic`, serial** | §6 | `diff` empty vs Python `psort -o dynamic` on `psort_test.plaso` |
-| **M2** | `null` + `rawpy` | Prove the engine contract with the trivial no-op module; `rawpy` needs no message formatting except display_name | byte-identical `rawpy`, `null` produces nothing |
-| **M3** | DSV family: `l2tcsv`, `tln`, `l2ttln` | Field-set/delimiter/header specialization; l2tcsv MACB-collapse + `extra`; deprecation warnings | byte-identical for all three vs Python |
-| **M4** | JSON family: `json_line`, `json` | Python-exact encoder (`ensure_ascii \uXXXX`, `', '`/`': '`, sort_keys), nested PathSpec/DateTime dicts, no textual sub-sort | byte-identical JSON output |
-| **M5** | Full `dftime` + timezone | All ~28 classes, `--output_time_zone`, `--dynamic_time`, local-time coercion, fraction-of-second, all sentinels | golden tests across a tz-varied corpus; DST-boundary cases |
+| **M2** ✅ | `null` + `rawpy` | Prove the engine contract with the trivial no-op module; `rawpy` needs no message formatting except display_name | **done** — byte-identical `rawpy`, `null` produces nothing |
+| **M3** ✅ | DSV family: `l2tcsv`, `tln`, `l2ttln` | Field-set/delimiter/header specialization; l2tcsv MACB-collapse + `extra` | **done** — byte-identical for all three vs Python (dedup + `-a`) |
+| **M4** ✅ | JSON family: `json_line`, `json` | Python-exact encoder (`ensure_ascii \uXXXX`, `', '`/`': '`, sort_keys), nested PathSpec/DateTime dicts, no textual sub-sort | **done** — byte-identical JSON output |
+| **M5** ✅ | `dftime` + timezone | Corpus classes rendered precisely (TimeElements, PosixTimeIn{Micro,Nano}seconds) with a microsecond fallback for others; `--output_time_zone`, `--dynamic_time`, local-time coercion, fraction-of-second, semantic `.string` | **done** — byte-identical against `America/New_York` + dynamic-time fixtures (DST-correct). Remaining ~28-class breadth tracked under M10 |
 | **M6** | CLI config surface | `--fields`, `--additional_fields`, `--custom_fields`, `--output_time_zone`, `--dynamic_time`, fallback hostname/path flags | matches Python for each flag combination |
 | **M7** | **Parallel hot path** | Worker pool for decode/join/format with in-order reassembly; mediator cache mutexes; status ticker | identical output to M1–M4; ≥5× speedup on a large `.plaso`, benchmarked |
 | **M8** | Event filters + time slicing | `internal/filter` (lexer/parser→tree→`Matches`), `TimeSlice`/`TimeRange`, filter-before-tag ordering, dead `limit` omitted | differential tests driven by `tests/filters/*` as oracle |

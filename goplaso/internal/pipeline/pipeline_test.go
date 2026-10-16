@@ -45,7 +45,18 @@ func modules() []moduleCase {
 	}
 }
 
+// outputConfig configures the mediator for an export (output time zone and the
+// dynamic-time flag).
+type outputConfig struct {
+	tz          string
+	dynamicTime bool
+}
+
 func export(t *testing.T, factory func(*mediator.Mediator) output.Module, dedup bool, workers int) []byte {
+	return exportCfg(t, factory, dedup, workers, outputConfig{})
+}
+
+func exportCfg(t *testing.T, factory func(*mediator.Mediator) output.Module, dedup bool, workers int, cfg outputConfig) []byte {
 	t.Helper()
 	fset := formatters.NewSet()
 	if err := fset.LoadDir(formattersDir); err != nil {
@@ -57,9 +68,15 @@ func export(t *testing.T, factory func(*mediator.Mediator) output.Module, dedup 
 	}
 	defer reader.Close()
 
+	med := mediator.New(fset)
+	if err := med.SetTimeZone(cfg.tz); err != nil {
+		t.Fatalf("set time zone: %v", err)
+	}
+	med.DynamicTime = cfg.dynamicTime
+
 	exp := &pipeline.Exporter{
 		Reader:  reader,
-		Module:  factory(mediator.New(fset)),
+		Module:  factory(med),
 		Dedup:   dedup,
 		Workers: workers,
 	}
@@ -146,6 +163,55 @@ func TestDynamicJSONLDeliverable(t *testing.T) {
 	}
 }
 
+// tzCase describes a --output_time_zone / --dynamic_time golden.
+type tzCase struct {
+	name    string
+	golden  string
+	factory func(*mediator.Mediator) output.Module
+	dedup   bool
+	cfg     outputConfig
+	module  string // psort -o NAME for the live oracle
+}
+
+func tzCases() []tzCase {
+	dyn := func(m *mediator.Mediator) output.Module { return output.NewDynamic(m) }
+	l2t := func(m *mediator.Mediator) output.Module { return output.NewL2TCSV(m) }
+	tln := func(m *mediator.Mediator) output.Module { return output.NewTLN(m) }
+	ny := outputConfig{tz: "America/New_York"}
+	dt := outputConfig{dynamicTime: true}
+	dtny := outputConfig{tz: "America/New_York", dynamicTime: true}
+	return []tzCase{
+		{"dynamic_nyc", "dynamic_nyc.csv", dyn, true, ny, "dynamic"},
+		{"dynamic_nyc_all", "dynamic_nyc_all.csv", dyn, false, ny, "dynamic"},
+		{"dynamic_dt", "dynamic_dt.csv", dyn, true, dt, "dynamic"},
+		{"dynamic_dt_nyc", "dynamic_dt_nyc.csv", dyn, true, dtny, "dynamic"},
+		{"l2tcsv_nyc", "l2tcsv_nyc.csv", l2t, true, ny, "l2tcsv"},
+		{"tln_dt", "tln_dt.txt", tln, true, dt, "tln"},
+	}
+}
+
+// TestTimeZoneAndDynamicTime diffs the --output_time_zone and --dynamic_time
+// combinations against committed Python psort fixtures.
+func TestTimeZoneAndDynamicTime(t *testing.T) {
+	for _, tc := range tzCases() {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			golden, err := os.ReadFile(filepath.Join("testdata", tc.golden))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := exportCfg(t, tc.factory, tc.dedup, 0, tc.cfg)
+			if !bytes.Equal(got, golden) {
+				t.Errorf("%s differs from golden %s\n%s", tc.name, tc.golden, firstDiff(golden, got))
+			}
+			// Worker count must not change output.
+			if par := exportCfg(t, tc.factory, tc.dedup, 8, tc.cfg); !bytes.Equal(par, golden) {
+				t.Errorf("%s workers=8 differs from golden", tc.name)
+			}
+		})
+	}
+}
+
 // TestDifferentialAgainstPython regenerates the oracle from live Python psort
 // and diffs, when GOPLASO_PSORT_ORACLE=1 and python3+plaso are available.
 func TestDifferentialAgainstPython(t *testing.T) {
@@ -159,13 +225,30 @@ func TestDifferentialAgainstPython(t *testing.T) {
 		mc := mc
 		for _, dedup := range []bool{true, false} {
 			t.Run(mc.name+dedupSuffix(dedup), func(t *testing.T) {
-				pyOut := runPython(t, mc.name, dedup)
+				pyOut := runPython(t, mc.name, dedup, nil)
 				got := export(t, mc.factory, dedup, 0)
 				if !bytes.Equal(got, pyOut) {
 					t.Errorf("Go %s (dedup=%v) differs from live Python psort\n%s", mc.name, dedup, firstDiff(pyOut, got))
 				}
 			})
 		}
+	}
+	for _, tc := range tzCases() {
+		tc := tc
+		t.Run("tz/"+tc.name, func(t *testing.T) {
+			var flags []string
+			if tc.cfg.tz != "" {
+				flags = append(flags, "--output_time_zone", tc.cfg.tz)
+			}
+			if tc.cfg.dynamicTime {
+				flags = append(flags, "--dynamic_time")
+			}
+			pyOut := runPython(t, tc.module, tc.dedup, flags)
+			got := exportCfg(t, tc.factory, tc.dedup, 0, tc.cfg)
+			if !bytes.Equal(got, pyOut) {
+				t.Errorf("Go %s differs from live Python psort\n%s", tc.name, firstDiff(pyOut, got))
+			}
+		})
 	}
 }
 
@@ -176,13 +259,14 @@ func dedupSuffix(dedup bool) string {
 	return "/all"
 }
 
-func runPython(t *testing.T, module string, dedup bool) []byte {
+func runPython(t *testing.T, module string, dedup bool, extraFlags []string) []byte {
 	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "py.out")
 	args := []string{filepath.Join("plaso", "scripts", "psort.py"), "-q", "-o", module, "-w", tmp}
 	if !dedup {
 		args = append(args, "-a")
 	}
+	args = append(args, extraFlags...)
 	args = append(args, filepath.Join("test_data", "psort_test.plaso"))
 	cmd := exec.Command("python3", args...)
 	cmd.Dir = repoRoot

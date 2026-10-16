@@ -8,22 +8,38 @@ formatting, single-threaded under the GIL).
 The goal is **byte-for-byte compatible output** with Python `psort`, verified by
 differential tests, while being able to parallelize the hot path in Go.
 
-## Status — first vertical slice complete ✅
+## Status — output modules + time zones ✅
 
-`goplaso-psort` reads a real `.plaso` SQLite storage file, time-orders and
-deduplicates events, formats them through plaso's own `data/formatters/*.yaml`,
-and emits the **`dynamic`** output module's default fields — either as native
-`dynamic` CSV (**byte-identical to Python `psort`**, the differential-test
-oracle) or as **JSON lines** ("dynamic as JSONL", the chosen deliverable).
+`goplaso-psort` reads a real `.plaso` SQLite storage file, time-orders,
+deduplicates and MACB-groups events, formats them through plaso's own
+`data/formatters/*.yaml`, and emits through any of the ported output modules —
+**byte-identical to Python `psort`** (the differential-test oracle):
 
-Verified on `test_data/psort_test.plaso`: 38 events → 20 after MACB dedup,
-byte-identical to Python `psort -o dynamic` (and `-a`), including the nanosecond
-→ microsecond ceil rounding of the `datetime` field and the DSV comma
-sanitization.
+| `-o` | format |
+|---|---|
+| `dynamic` | the default configurable DSV (CSV) |
+| `dynamic-jsonl` | dynamic field set as JSON lines (the port's extra deliverable) |
+| `l2tcsv` | legacy log2timeline 17-field CSV (MACB-group collapse, `extra` column) |
+| `tln` / `l2ttln` | TLN / extended-TLN pipe-delimited |
+| `rawpy` | native ("raw") Python text dump |
+| `json_line` / `json` | one JSON object per line / a single framed JSON object |
+| `null` | discards everything |
+
+All are verified byte-for-byte on `test_data/psort_test.plaso` (38 events → 20
+after MACB dedup) against Python `psort`, in both deduplicated and include-all
+(`-a`) modes, including the nanosecond→microsecond ceil rounding of the
+`datetime` field, the DSV sanitization, l2tcsv's MACB-group collapse, and the
+Python-exact JSON encoding (`ensure_ascii`, `', '`/`': '` separators, sorted
+keys). `--output_time_zone` and `--dynamic_time` are supported for the DSV
+modules and verified against `America/New_York` fixtures (DST-correct offsets
+and `EST`/`EDT` abbreviations).
 
 ```
 go run ./cmd/goplaso-psort -o dynamic       -w out.csv   --data_location ../plaso/data  ../test_data/psort_test.plaso
+go run ./cmd/goplaso-psort -o l2tcsv        -w out.csv   --data_location ../plaso/data  ../test_data/psort_test.plaso
+go run ./cmd/goplaso-psort -o json_line     -w out.jsonl --data_location ../plaso/data  ../test_data/psort_test.plaso
 go run ./cmd/goplaso-psort -o dynamic-jsonl -w out.jsonl --data_location ../plaso/data  ../test_data/psort_test.plaso
+go run ./cmd/goplaso-psort -o dynamic --output_time_zone America/New_York -w out.csv --data_location ../plaso/data in.plaso
 go run ./cmd/goplaso-psort -o dynamic --workers 8 -w out.csv --data_location ../plaso/data in.plaso
 ```
 
@@ -82,12 +98,12 @@ The real levers, all within the SQLite format, applied here:
 |---|---|---|
 | `internal/container` | Event / EventData / EventDataStream model, dfDateTime decode, lossless JSON (`json.Number`) | `plaso/containers`, `acstore` |
 | `internal/plasostore` | `.plaso` SQLite reader: metadata gate, event+event_data streamed in timestamp order via one ordered JOIN, zlib+JSON blob decode, event-tag/stream indexes | `acstore/sqlite_store`, `plaso/storage/sqlite` |
-| `internal/dftime` | dfdatetime display-microsecond rule (`_FormatDateTime`), ceil rounding | `dfdatetime` |
-| `internal/dfpath` | dfVFS path-spec decode + display name | `dfvfs`, `plaso/engine/path_helper` |
-| `internal/formatters` | YAML formatter loader, conditional/basic formatters, helpers, Python `str.format` mini-engine | `plaso/formatters` |
-| `internal/mediator` | message-formatter / source-mapping / time-zone resolution | `plaso/output/mediator` |
-| `internal/output` | `dynamic` field callbacks, DSV sanitizer + CSV, JSONL encoder, within-bucket sort key | `plaso/output/{formatting_helper,shared_dsv,dynamic,text_file}` |
-| `internal/pipeline` | streaming export loop: fixed worker pool (decode→format→discard) with sequence-ordered reassembly, timestamp buckets, `(hash, desc)` dedup, MACB passthrough, textual sub-sort | `plaso/multi_process/output_engine` |
+| `internal/dftime` | dfdatetime display-microsecond rule (`_FormatDateTime`), ceil rounding, ISO8601 render (fixed-microsecond and native dynamic-time), POSIX-second / date / time / time-zone rendering in any IANA zone | `dfdatetime` |
+| `internal/dfpath` | dfVFS path-spec decode, display name, `.comparable` | `dfvfs`, `plaso/engine/path_helper` |
+| `internal/formatters` | YAML formatter loader, conditional/basic formatters, helpers, Python `str.format` mini-engine, `GetMessageShort`, format-string attribute names, Python `str()`/`repr()` of values | `plaso/formatters` |
+| `internal/mediator` | message-formatter / source-mapping / time-zone resolution, hostname / username / MACB representation | `plaso/output/mediator` |
+| `internal/output` | `Module`/`Sink` abstraction; field callbacks (`FieldComputer`); the DSV family (`dynamic`, `l2tcsv`, `tln`, `l2ttln`) with sanitizer, `SortedStringHeap` and l2tcsv MACB-collapse; `rawpy`; `json`/`json_line` with a Python-exact JSON encoder; `null` | `plaso/output/{formatting_helper,shared_dsv,dynamic,l2t_csv,tln,rawpy,shared_json,json_line,json_out,null,text_file,interface}` |
+| `internal/pipeline` | streaming export loop: fixed worker pool (decode→format→discard) with sequence-ordered reassembly, timestamp buckets, `(hash, desc)` dedup, MACB grouping, then the module's sink (textual sub-sort / direct / framed) | `plaso/multi_process/output_engine` |
 | `cmd/goplaso-psort` | CLI | `plaso/cli/psort_tool`, `plaso/scripts/psort` |
 
 ## Testing
@@ -103,18 +119,21 @@ The golden fixtures in `internal/pipeline/testdata/` were produced by Python
 ## Roadmap
 
 See [`docs/PORT_PLAN.md`](docs/PORT_PLAN.md) for the full architecture map and
-milestones. Done so far: **M1** (dynamic output, byte-identical), **M7**
-(parallel decode+format hot path), and a **streaming, bounded-memory** engine
-(constant-ish RSS regardless of store size). Still open: other output modules
-(l2tcsv, tln, json/json_line), full dfdatetime + arbitrary output time zones,
-the CLI config surface (`--fields`, time-slicing), event filters, and
-`winevt_rc`.
+milestones. Done so far: **M1** (dynamic output), **M2** (`null`, `rawpy`),
+**M3** (DSV family: `l2tcsv`, `tln`, `l2ttln`), **M4** (`json`, `json_line`),
+**M5** (`--output_time_zone` / `--dynamic_time`), **M7** (parallel decode+format
+hot path), and a **streaming, bounded-memory** engine (constant-ish RSS
+regardless of store size). Still open: the remaining CLI config surface
+(`--fields`, `--additional_fields`, `--custom_fields`), event filters and
+time-slicing (M8), `winevt_rc` (M9), and `kml`/`xlsx`/`opensearch`.
 
-Current simplifications (tracked for later milestones): output time zone is UTC
-only; `dftime` covers the classes in the test corpus (`TimeElements`,
-`PosixTimeInNanoseconds`, `PosixTimeInMicroseconds`); `dfpath` covers flat path
-specs; event filters, time-slicing, analysis plugins, and other output modules
-are not yet implemented. The pipeline formats every event before dedup (Python
-formats only survivors); harmless and faster on low-duplicate data. The
-event-tag and event-data-stream indexes are still loaded up front (small
-relative to events); the bucket of equal-timestamp events is held transiently.
+Current simplifications (tracked for later milestones): `dftime` renders the
+classes the test corpus exercises (`TimeElements`, `PosixTimeInNanoseconds`,
+`PosixTimeInMicroseconds`) precisely, with a microsecond fallback for the other
+dfdatetime classes and faithful-but-unverified local-time/semantic-time
+handling; `dfpath` covers flat path specs; event filters, time-slicing and
+analysis plugins are not yet implemented. The pipeline formats every event
+before dedup (Python formats only survivors); harmless and faster on
+low-duplicate data. The event-tag and event-data-stream indexes are still
+loaded up front (small relative to events); the bucket of equal-timestamp
+events is held transiently.

@@ -36,6 +36,8 @@ func run() error {
 		includeAll   = flag.Bool("a", false, "include all events (disable deduplication)")
 		workers      = flag.Int("workers", 0, "decode/format worker count (0=NumCPU, 1=serial)")
 		gcPercent    = flag.Int("gc_percent", 400, "Go GC target percent; higher trades memory for speed, -1 disables GC")
+		outputTZ     = flag.String("output_time_zone", "", "IANA time zone for date/time output fields (default: UTC)")
+		dynamicTime  = flag.Bool("dynamic_time", false, "render date/time values in their native granularity")
 	)
 	flag.Parse()
 
@@ -66,6 +68,10 @@ func run() error {
 	defer reader.Close()
 
 	med := mediator.New(formatterSet)
+	if err := med.SetTimeZone(*outputTZ); err != nil {
+		return err
+	}
+	med.DynamicTime = *dynamicTime
 	var module output.Module
 	switch *outputFormat {
 	case "dynamic":

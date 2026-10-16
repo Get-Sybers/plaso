@@ -55,9 +55,12 @@ func dataType(ed *container.EventData) string {
 	return ed.DataType
 }
 
-// datetime mirrors _FormatDateTime (non-dynamic-time): the displayed microsecond
-// timestamp rendered as ISO 8601 with offset, with the 0-timestamp sentinel.
+// datetime mirrors _FormatDateTime for both the dynamic-time and non-dynamic
+// paths.
 func (c *FieldComputer) datetime(ev *container.Event) string {
+	if c.med.DynamicTime && ev.DateTime != nil {
+		return dftime.ISO8601Dynamic(ev.DateTime, ev.Timestamp, c.loc())
+	}
 	if ev.Timestamp == 0 {
 		return "0000-00-00T00:00:00.000000+00:00"
 	}
@@ -77,7 +80,7 @@ func (c *FieldComputer) dateISO(ev *container.Event) string {
 	if !ok {
 		return "0000-00-00"
 	}
-	return dftime.FormatDate(seconds)
+	return dftime.FormatDate(seconds, c.loc())
 }
 
 // dateL2T mirrors L2TCSVFieldFormattingHelper._FormatDate ("MM/DD/YYYY").
@@ -89,7 +92,7 @@ func (c *FieldComputer) dateL2T(ev *container.Event) string {
 	if !ok {
 		return "00/00/0000"
 	}
-	return dftime.FormatL2TDate(seconds)
+	return dftime.FormatL2TDate(seconds, c.loc())
 }
 
 // timeField mirrors _FormatTime ("HH:MM:SS").
@@ -101,7 +104,7 @@ func (c *FieldComputer) timeField(ev *container.Event) string {
 	if !ok {
 		return "--:--:--"
 	}
-	return dftime.FormatTimeOfDay(seconds)
+	return dftime.FormatTimeOfDay(seconds, c.loc())
 }
 
 // timezone mirrors _FormatTimeZone.
@@ -117,8 +120,7 @@ func (c *FieldComputer) timezone(ev *container.Event) string {
 	if !ok {
 		return "-"
 	}
-	name, _ := time.Unix(seconds, 0).In(loc).Zone()
-	return name
+	return dftime.TimeZoneName(seconds, loc)
 }
 
 // timestampSeconds mirrors TLNFieldFormattingHelper._FormatTimestamp.

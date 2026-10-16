@@ -5,8 +5,10 @@
 package mediator
 
 import (
+	"fmt"
 	"strings"
 	"time"
+	_ "time/tzdata" // embed the IANA time zone database so --output_time_zone works without system zoneinfo
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
 	"github.com/Get-Sybers/plaso/goplaso/internal/formatters"
@@ -49,6 +51,21 @@ type Mediator struct {
 // New creates a mediator with the given formatter set, defaulting to UTC.
 func New(f *formatters.Set) *Mediator {
 	return &Mediator{Formatters: f, TimeZone: time.UTC}
+}
+
+// SetTimeZone sets the output time zone from an IANA name (e.g.
+// "America/New_York"), mirroring OutputMediator.SetTimeZone. An empty name keeps
+// the default (UTC).
+func (m *Mediator) SetTimeZone(name string) error {
+	if name == "" {
+		return nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return fmt.Errorf("unsupported time zone: %s", name)
+	}
+	m.TimeZone = loc
+	return nil
 }
 
 // GetMessageFormatter returns the formatter for a data type, or nil.
