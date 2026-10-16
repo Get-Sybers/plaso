@@ -24,7 +24,29 @@ sanitization.
 ```
 go run ./cmd/goplaso-psort -o dynamic       -w out.csv   --data_location ../plaso/data  ../test_data/psort_test.plaso
 go run ./cmd/goplaso-psort -o dynamic-jsonl -w out.jsonl --data_location ../plaso/data  ../test_data/psort_test.plaso
+go run ./cmd/goplaso-psort -o dynamic --workers 8 -w out.csv --data_location ../plaso/data in.plaso
 ```
+
+The per-event hot path (event_data zlib inflate + JSON decode, date_time parse,
+and message formatting) runs on a bounded worker pool (`--workers`, default
+`NumCPU`); the reader and the dedup/sort/write stage stay serial, so output is
+byte-identical at any worker count.
+
+### Performance
+
+On a synthetic 114k-event store (4 vCPU), producing byte-identical output to
+Python `psort -o dynamic`:
+
+| | time | vs Python |
+|---|---|---|
+| Python `psort` | 12.4 s | 1.0× |
+| `goplaso-psort --workers 1` | 8.3 s | 1.5× |
+| `goplaso-psort --workers 4` | 4.7 s | 2.6× |
+| `goplaso-psort --workers 8` | 4.2 s | 2.9× |
+
+Scaling is sub-linear because the SQLite `ORDER BY timestamp` scan and the
+dedup/sort/write stage are inherently serial (Amdahl's law); the parallel
+decode+format is what the worker pool accelerates.
 
 ## Package layout
 
@@ -37,7 +59,7 @@ go run ./cmd/goplaso-psort -o dynamic-jsonl -w out.jsonl --data_location ../plas
 | `internal/formatters` | YAML formatter loader, conditional/basic formatters, helpers, Python `str.format` mini-engine | `plaso/formatters` |
 | `internal/mediator` | message-formatter / source-mapping / time-zone resolution | `plaso/output/mediator` |
 | `internal/output` | `dynamic` field callbacks, DSV sanitizer + CSV, JSONL encoder, within-bucket sort key | `plaso/output/{formatting_helper,shared_dsv,dynamic,text_file}` |
-| `internal/pipeline` | export loop: timestamp buckets, `(hash, desc)` order, dedup, MACB passthrough, textual sub-sort | `plaso/multi_process/output_engine` |
+| `internal/pipeline` | export loop: timestamp buckets, `(hash, desc)` order, dedup, MACB passthrough, textual sub-sort, bounded worker pool with in-order reassembly | `plaso/multi_process/output_engine` |
 | `cmd/goplaso-psort` | CLI | `plaso/cli/psort_tool`, `plaso/scripts/psort` |
 
 ## Testing
@@ -53,12 +75,15 @@ The golden fixtures in `internal/pipeline/testdata/` were produced by Python
 ## Roadmap
 
 See [`docs/PORT_PLAN.md`](docs/PORT_PLAN.md) for the full architecture map and
-milestones (M0 reader → M1 dynamic *(done)* → other output modules → full
-dfdatetime/timezone → CLI surface → parallel hot path → filters → winevt_rc →
-parity sweep).
+milestones. Done so far: **M1** (dynamic output, byte-identical) and **M7**
+(parallel decode+format hot path). Still open: other output modules (l2tcsv,
+tln, json/json_line), full dfdatetime + arbitrary output time zones, the CLI
+config surface (`--fields`, time-slicing), event filters, and `winevt_rc`.
 
 Current simplifications (tracked for later milestones): output time zone is UTC
 only; `dftime` covers the classes in the test corpus (`TimeElements`,
-`PosixTimeInNanoseconds`); `dfpath` covers flat path specs; event filters,
-time-slicing, analysis plugins, the parallel worker pool, and other output
-modules are not yet implemented.
+`PosixTimeInNanoseconds`, `PosixTimeInMicroseconds`); `dfpath` covers flat path
+specs; event filters, time-slicing, analysis plugins, and other output modules
+are not yet implemented. The parallel path formats every event before dedup
+(Python formats only survivors); harmless and faster on low-duplicate data, but
+a future tweak can defer formatting to post-dedup.

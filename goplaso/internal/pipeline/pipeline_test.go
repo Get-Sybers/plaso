@@ -24,6 +24,10 @@ var (
 )
 
 func export(t *testing.T, mode pipeline.Mode, dedup bool) []byte {
+	return exportW(t, mode, dedup, 0)
+}
+
+func exportW(t *testing.T, mode pipeline.Mode, dedup bool, workers int) []byte {
 	t.Helper()
 	fset := formatters.NewSet()
 	if err := fset.LoadDir(formattersDir); err != nil {
@@ -40,12 +44,29 @@ func export(t *testing.T, mode pipeline.Mode, dedup bool) []byte {
 		Dynamic: output.NewDynamic(mediator.New(fset)),
 		Mode:    mode,
 		Dedup:   dedup,
+		Workers: workers,
 	}
 	var buf bytes.Buffer
 	if err := exp.Export(&buf); err != nil {
 		t.Fatalf("export: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// TestSerialParallelEquivalence asserts the worker count never changes output:
+// serial (1), parallel (4), and heavy oversubscription (16) must all match the
+// deduplicated golden exactly.
+func TestSerialParallelEquivalence(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("testdata", "dynamic.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, workers := range []int{1, 2, 4, 16} {
+		got := exportW(t, pipeline.ModeCSV, true, workers)
+		if !bytes.Equal(got, golden) {
+			t.Errorf("workers=%d differs from golden\n%s", workers, firstDiff(golden, got))
+		}
+	}
 }
 
 func TestDynamicCSVMatchesGolden(t *testing.T) {

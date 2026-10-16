@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -108,7 +109,7 @@ type Formatter struct {
 
 	pieceAttrs      []string // conditional: attr name per message piece (lazy)
 	shortPieceAttrs []string // lazy
-	mapsBuilt       bool
+	mapsOnce        sync.Once
 	buildErr        error
 }
 
@@ -130,14 +131,12 @@ func (f *Formatter) FormatEventValues(values map[string]any, custom CustomRegist
 // buildMaps computes the per-piece attribute maps lazily, mirroring plaso's
 // _CreateFormatStringMaps (which runs on first GetMessage, not at load).
 func (f *Formatter) buildMaps() error {
-	if f.mapsBuilt {
-		return f.buildErr
-	}
-	f.mapsBuilt = true
-	if f.pieceAttrs, f.buildErr = pieceAttrNames(f.messagePieces); f.buildErr != nil {
-		return f.buildErr
-	}
-	f.shortPieceAttrs, f.buildErr = pieceAttrNames(f.shortPieces)
+	f.mapsOnce.Do(func() {
+		if f.pieceAttrs, f.buildErr = pieceAttrNames(f.messagePieces); f.buildErr != nil {
+			return
+		}
+		f.shortPieceAttrs, f.buildErr = pieceAttrNames(f.shortPieces)
+	})
 	return f.buildErr
 }
 

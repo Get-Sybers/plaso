@@ -4,11 +4,17 @@
 // sub-sort, and writes each surviving event. Mirrors the serial core of
 // plaso/multi_process/output_engine.py (PsortEventHeap, _FlushExportBuffer)
 // and the SortedStringHeap in plaso/output/text_file.py.
+//
+// The expensive per-event work (event_data blob inflate + JSON decode, and
+// message formatting) is independent across events, so it can run on a bounded
+// worker pool while the ordered reader and the serial dedup/sort/write stage
+// preserve byte-identical output.
 package pipeline
 
 import (
 	"bufio"
 	"io"
+	"runtime"
 	"sort"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
@@ -32,6 +38,15 @@ type Exporter struct {
 	Dynamic *output.Dynamic
 	Mode    Mode
 	Dedup   bool
+	// Workers bounds the decode/format worker pool. 0 selects runtime.NumCPU();
+	// 1 runs the fully serial path.
+	Workers int
+}
+
+// processed is a hydrated event with its computed output record.
+type processed struct {
+	ev  *container.Event
+	rec *output.Record
 }
 
 // Export writes all events to w.
@@ -45,42 +60,140 @@ func (e *Exporter) Export(w io.Writer) error {
 		}
 	}
 
-	var bucket []*container.Event
-	var bucketTS int64
-	started := false
+	s := &sink{bw: bw, mode: e.Mode, dedup: e.Dedup, dyn: e.Dynamic}
 
-	flush := func() error { return e.flushBucket(bw, bucket) }
+	workers := e.Workers
+	if workers == 0 {
+		workers = runtime.NumCPU()
+	}
 
-	err := e.Reader.Each(func(ev *container.Event) error {
-		if started && ev.Timestamp != bucketTS {
-			if err := flush(); err != nil {
-				return err
-			}
-			bucket = bucket[:0]
-		}
-		bucketTS = ev.Timestamp
-		started = true
-		bucket = append(bucket, ev)
-		return nil
-	})
+	// Decode every event_data blob up front, in parallel at the chosen width
+	// (this is the dominant per-event cost). With workers==1 this is a serial
+	// decode, giving a meaningful serial-vs-parallel comparison.
+	if err := e.Reader.PreloadEventData(workers); err != nil {
+		return err
+	}
+
+	var err error
+	if workers <= 1 {
+		err = e.exportSerial(s)
+	} else {
+		err = e.exportParallel(s, workers)
+	}
 	if err != nil {
 		return err
 	}
-	if started {
-		if err := flush(); err != nil {
-			return err
-		}
+	if err := s.finish(); err != nil {
+		return err
 	}
 	return bw.Flush()
 }
 
-// flushBucket processes one equal-timestamp bucket.
-func (e *Exporter) flushBucket(bw *bufio.Writer, bucket []*container.Event) error {
+// exportSerial hydrates and formats each event inline, in order.
+func (e *Exporter) exportSerial(s *sink) error {
+	return e.Reader.StreamRaw(func(raw plasostore.RawEvent) error {
+		ev, err := e.Reader.Hydrate(raw)
+		if err != nil {
+			return err
+		}
+		return s.add(processed{ev: ev, rec: e.Dynamic.Compute(ev)})
+	})
+}
+
+type procResult struct {
+	ev  *container.Event
+	rec *output.Record
+	err error
+}
+
+// exportParallel hydrates and formats events on a bounded worker pool while a
+// queue of per-event result channels preserves the reader's timestamp order.
+func (e *Exporter) exportParallel(s *sink, workers int) error {
+	sem := make(chan struct{}, workers)
+	futures := make(chan chan procResult, workers*2)
+
+	var produceErr error
+	go func() {
+		defer close(futures)
+		produceErr = e.Reader.StreamRaw(func(raw plasostore.RawEvent) error {
+			ch := make(chan procResult, 1)
+			futures <- ch
+			sem <- struct{}{}
+			go func(raw plasostore.RawEvent, ch chan procResult) {
+				defer func() { <-sem }()
+				ev, err := e.Reader.Hydrate(raw)
+				if err != nil {
+					ch <- procResult{err: err}
+					return
+				}
+				ch <- procResult{ev: ev, rec: e.Dynamic.Compute(ev)}
+			}(raw, ch)
+			return nil
+		})
+	}()
+
+	var firstErr error
+	for ch := range futures {
+		r := <-ch
+		if firstErr != nil {
+			continue // keep draining so workers finish and the producer unblocks
+		}
+		if r.err != nil {
+			firstErr = r.err
+			continue
+		}
+		if err := s.add(processed{ev: r.ev, rec: r.rec}); err != nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return produceErr
+}
+
+// sink accumulates processed events into equal-timestamp buckets and flushes
+// each bucket (dedup + within-bucket textual sub-sort) to the writer.
+type sink struct {
+	bw    *bufio.Writer
+	mode  Mode
+	dedup bool
+	dyn   *output.Dynamic
+
+	bucket   []processed
+	bucketTS int64
+	started  bool
+}
+
+func (s *sink) add(p processed) error {
+	if s.started && p.ev.Timestamp != s.bucketTS {
+		if err := s.flush(); err != nil {
+			return err
+		}
+		s.bucket = s.bucket[:0]
+	}
+	s.bucketTS = p.ev.Timestamp
+	s.started = true
+	s.bucket = append(s.bucket, p)
+	return nil
+}
+
+func (s *sink) finish() error {
+	if s.started {
+		return s.flush()
+	}
+	return nil
+}
+
+// flush processes one equal-timestamp bucket.
+func (s *sink) flush() error {
+	bucket := s.bucket
+
 	// Primary within-bucket order: (event_values_hash, timestamp_desc), ties
 	// broken by identifier for determinism (plaso breaks them on duplicate
-	// content which is then discarded anyway).
+	// content, which is then discarded anyway).
 	sort.SliceStable(bucket, func(i, j int) bool {
-		a, b := bucket[i], bucket[j]
+		a, b := bucket[i].ev, bucket[j].ev
 		ha, hb := hashOf(a), hashOf(b)
 		if ha != hb {
 			return ha < hb
@@ -96,41 +209,32 @@ func (e *Exporter) flushBucket(bw *bufio.Writer, bucket []*container.Event) erro
 	survivors := bucket[:0:0]
 	var lastDesc, lastHash string
 	hasPrev := false
-	for _, ev := range bucket {
-		h := hashOf(ev)
-		if e.Dedup && hasPrev && ev.TimestampDesc == lastDesc && h == lastHash {
+	for _, p := range bucket {
+		h := hashOf(p.ev)
+		if s.dedup && hasPrev && p.ev.TimestampDesc == lastDesc && h == lastHash {
 			continue
 		}
-		survivors = append(survivors, ev)
-		lastDesc, lastHash = ev.TimestampDesc, h
+		survivors = append(survivors, p)
+		lastDesc, lastHash = p.ev.TimestampDesc, h
 		hasPrev = true
 	}
 
-	// Compute field values and apply the dynamic module's textual sub-sort:
-	// ascending by (sort key, output line), matching the SortedStringHeap.
-	type row struct {
-		sortKey string
-		csv     string
-		rec     *output.Record
-	}
-	rows := make([]row, 0, len(survivors))
-	for _, ev := range survivors {
-		rec := e.Dynamic.Compute(ev)
-		rows = append(rows, row{sortKey: rec.SortKey(), csv: rec.CSVLine(), rec: rec})
-	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		if rows[i].sortKey != rows[j].sortKey {
-			return rows[i].sortKey < rows[j].sortKey
+	// Dynamic module textual sub-sort: ascending by (sort key, output line),
+	// matching the SortedStringHeap.
+	sort.SliceStable(survivors, func(i, j int) bool {
+		ki, kj := survivors[i].rec.SortKey(), survivors[j].rec.SortKey()
+		if ki != kj {
+			return ki < kj
 		}
-		return rows[i].csv < rows[j].csv
+		return survivors[i].rec.CSVLine() < survivors[j].rec.CSVLine()
 	})
 
-	for _, r := range rows {
+	for _, p := range survivors {
 		var err error
-		if e.Mode == ModeCSV {
-			_, err = bw.WriteString(r.csv)
+		if s.mode == ModeCSV {
+			_, err = s.bw.WriteString(p.rec.CSVLine())
 		} else {
-			_, err = bw.WriteString(r.rec.JSONLine())
+			_, err = s.bw.WriteString(p.rec.JSONLine())
 		}
 		if err != nil {
 			return err

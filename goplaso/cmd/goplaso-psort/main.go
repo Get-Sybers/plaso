@@ -33,6 +33,7 @@ func run() error {
 		writePath    = flag.String("w", "", "output file (default: stdout)")
 		dataLocation = flag.String("data_location", "", "plaso data directory (contains formatters/)")
 		includeAll   = flag.Bool("a", false, "include all events (disable deduplication)")
+		workers      = flag.Int("workers", 0, "decode/format worker count (0=NumCPU, 1=serial)")
 	)
 	flag.Parse()
 
@@ -72,6 +73,7 @@ func run() error {
 		Dynamic: output.NewDynamic(med),
 		Mode:    mode,
 		Dedup:   !*includeAll,
+		Workers: *workers,
 	}
 
 	out := os.Stdout

@@ -4,7 +4,10 @@
 // schema-based tables (explicit typed columns: event, event_tag,
 // event_data_stream, ...) or in schema-less BLOB tables whose `_data` column
 // holds a zlib-compressed JSON attribute container (event_data,
-// analysis_report). See scratchpad/GROUND_TRUTH.md.
+// analysis_report). See docs/PORT_PLAN.md / scratchpad GROUND_TRUTH.
+//
+// event_data blobs are decoded lazily and cached, so an export can decode them
+// concurrently across a worker pool: GetEventData is safe for concurrent use.
 package plasostore
 
 import (
@@ -13,6 +16,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
 
@@ -31,13 +35,19 @@ type Reader struct {
 	db   *sql.DB
 	meta map[string]string
 
-	eventData   map[int64]*container.EventData
+	// Small, shared, read-only after Open — safe for concurrent reads.
 	eventStream map[int64]*container.EventDataStream
 	tagsByEvent map[int64][]string
+
+	// event_data is bulk-scanned then decoded in parallel at Open and cached.
+	// After preload the cache is immutable, so reads need no lock.
+	edMu        sync.Mutex
+	edCache     map[int64]*container.EventData
+	edPreloaded bool
 }
 
-// Open opens a .plaso file read-only and loads the related-container indexes
-// (event_data, event_data_stream, event_tag) needed to resolve events.
+// Open opens a .plaso file read-only and loads the small related-container
+// indexes (event_data_stream, event_tag). event_data is decoded lazily.
 func Open(path string) (r *Reader, err error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
 	if err != nil {
@@ -48,11 +58,14 @@ func Open(path string) (r *Reader, err error) {
 			db.Close()
 		}
 	}()
+	// Allow the ordered streaming query and concurrent per-event point lookups
+	// to each hold their own connection (the file is opened read-only).
+	db.SetMaxOpenConns(0) // unlimited; actual concurrency is bounded by the exporter
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 
-	r = &Reader{db: db}
+	r = &Reader{db: db, edCache: map[int64]*container.EventData{}}
 	if err = r.loadMetadata(); err != nil {
 		return nil, err
 	}
@@ -62,13 +75,71 @@ func Open(path string) (r *Reader, err error) {
 	if err = r.loadEventDataStreams(); err != nil {
 		return nil, err
 	}
-	if err = r.loadEventData(); err != nil {
-		return nil, err
-	}
 	if err = r.loadEventTags(); err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+// PreloadEventData bulk-scans every event_data blob (fast serial I/O) and
+// decodes them (zlib inflate + JSON) across a worker pool, since the decode is
+// the dominant per-event cost and is independent per row. After this the cache
+// is complete and immutable, so GetEventData reads it without locking. It is
+// idempotent; workers < 1 is treated as 1 (serial decode). When not called,
+// GetEventData falls back to decoding lazily per row.
+func (r *Reader) PreloadEventData(workers int) error {
+	if r.edPreloaded {
+		return nil
+	}
+	rows, err := r.db.Query("SELECT _identifier, _data FROM event_data")
+	if err != nil {
+		return fmt.Errorf("read event_data: %w", err)
+	}
+	type rawBlob struct {
+		id   int64
+		blob []byte
+	}
+	var all []rawBlob
+	for rows.Next() {
+		var id int64
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan event_data: %w", err)
+		}
+		all = append(all, rawBlob{id: id, blob: append([]byte(nil), blob...)})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if workers < 1 {
+		workers = 1
+	}
+	decoded := make([]*container.EventData, len(all))
+	errs := make([]error, len(all))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i := range all {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			decoded[i], errs[i] = r.buildEventData(all[i].id, all[i].blob)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range all {
+		if errs[i] != nil {
+			return errs[i]
+		}
+		r.edCache[all[i].id] = decoded[i]
+	}
+	r.edPreloaded = true
+	return nil
 }
 
 // Close releases the underlying database.
@@ -140,49 +211,71 @@ var reservedEventDataKeys = map[string]bool{
 	"_event_values_hash":            true,
 }
 
-func (r *Reader) loadEventData() error {
-	rows, err := r.db.Query("SELECT _identifier, _data FROM event_data")
+// buildEventData decodes one event_data blob into a container.EventData and
+// resolves its event_data_stream.
+func (r *Reader) buildEventData(id int64, blob []byte) (*container.EventData, error) {
+	obj, err := decodeContainerBlob(blob)
 	if err != nil {
-		return fmt.Errorf("read event_data: %w", err)
+		return nil, fmt.Errorf("event_data %d: %w", id, err)
 	}
-	defer rows.Close()
-	r.eventData = map[int64]*container.EventData{}
-	for rows.Next() {
-		var id int64
-		var blob []byte
-		if err := rows.Scan(&id, &blob); err != nil {
-			return fmt.Errorf("scan event_data: %w", err)
-		}
-		obj, err := decodeContainerBlob(blob)
-		if err != nil {
-			return fmt.Errorf("event_data %d: %w", id, err)
-		}
-		ed := &container.EventData{
-			Identifier: id,
-			Attributes: map[string]any{},
-		}
-		for k, v := range obj {
-			switch k {
-			case "data_type":
-				ed.DataType, _ = v.(string)
-			case "_parser_chain":
-				ed.ParserChain, _ = v.(string)
-			case "_event_data_stream_identifier":
-				ed.EventDataStreamIdentifier, _ = v.(string)
-			case "_event_values_hash":
-				ed.EventValuesHash, _ = v.(string)
-			default:
-				if !reservedEventDataKeys[k] {
-					ed.Attributes[k] = v
-				}
+	ed := &container.EventData{Identifier: id, Attributes: map[string]any{}}
+	for k, v := range obj {
+		switch k {
+		case "data_type":
+			ed.DataType, _ = v.(string)
+		case "_parser_chain":
+			ed.ParserChain, _ = v.(string)
+		case "_event_data_stream_identifier":
+			ed.EventDataStreamIdentifier, _ = v.(string)
+		case "_event_values_hash":
+			ed.EventValuesHash, _ = v.(string)
+		default:
+			if !reservedEventDataKeys[k] {
+				ed.Attributes[k] = v
 			}
 		}
-		if idf, ok := container.ParseIdentifier(ed.EventDataStreamIdentifier); ok {
-			ed.Stream = r.eventStream[idf.SequenceNumber]
-		}
-		r.eventData[id] = ed
 	}
-	return rows.Err()
+	if idf, ok := container.ParseIdentifier(ed.EventDataStreamIdentifier); ok {
+		ed.Stream = r.eventStream[idf.SequenceNumber] // read-only map
+	}
+	return ed, nil
+}
+
+// GetEventData returns the decoded event_data with the given sequence number
+// (rowid), decoding and caching on first use. Safe for concurrent use.
+func (r *Reader) GetEventData(seq int64) (*container.EventData, error) {
+	if r.edPreloaded {
+		// Cache is immutable after preload: read without locking.
+		return r.edCache[seq], nil
+	}
+
+	r.edMu.Lock()
+	if ed, ok := r.edCache[seq]; ok {
+		r.edMu.Unlock()
+		return ed, nil
+	}
+	r.edMu.Unlock()
+
+	// Decode outside the lock so concurrent decodes of different rows proceed
+	// in parallel (a rare duplicate decode of the same row is harmless).
+	var blob []byte
+	err := r.db.QueryRow("SELECT _data FROM event_data WHERE _identifier = ?", seq).Scan(&blob)
+	if err != nil {
+		return nil, fmt.Errorf("read event_data %d: %w", seq, err)
+	}
+	ed, err := r.buildEventData(seq, blob)
+	if err != nil {
+		return nil, err
+	}
+
+	r.edMu.Lock()
+	if cached, ok := r.edCache[seq]; ok {
+		ed = cached // keep the first stored instance
+	} else {
+		r.edCache[seq] = ed
+	}
+	r.edMu.Unlock()
+	return ed, nil
 }
 
 func (r *Reader) loadEventDataStreams() error {
@@ -249,10 +342,20 @@ func decodeStringArray(s string) ([]string, error) {
 	return out, nil
 }
 
-// Each streams events in timestamp order (ties broken by _identifier),
-// resolving each event's EventData (+Stream) and Tags, invoking fn per event.
-// Iteration stops and returns the first error fn returns.
-func (r *Reader) Each(fn func(*container.Event) error) error {
+// RawEvent is an undecoded event row: the event_data is not resolved and the
+// date_time JSON is not parsed, so that work can be deferred to a worker pool.
+type RawEvent struct {
+	Identifier          int64
+	EventDataIdentifier string
+	DateTimeJSON        string
+	Timestamp           int64
+	TimestampDesc       string
+}
+
+// StreamRaw streams event rows in timestamp order (ties broken by _identifier)
+// without resolving event_data or parsing date_time. Iteration stops on the
+// first error fn returns.
+func (r *Reader) StreamRaw(fn func(RawEvent) error) error {
 	rows, err := r.db.Query(
 		"SELECT _identifier, _event_data_identifier, date_time, timestamp, timestamp_desc " +
 			"FROM event ORDER BY timestamp, _identifier")
@@ -262,32 +365,61 @@ func (r *Reader) Each(fn func(*container.Event) error) error {
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			ev           container.Event
+			raw          RawEvent
 			dataRef      sql.NullString
 			dateTimeJSON sql.NullString
 			ts           sql.NullInt64
 			desc         sql.NullString
 		)
-		if err := rows.Scan(&ev.Identifier, &dataRef, &dateTimeJSON, &ts, &desc); err != nil {
+		if err := rows.Scan(&raw.Identifier, &dataRef, &dateTimeJSON, &ts, &desc); err != nil {
 			return fmt.Errorf("scan event: %w", err)
 		}
-		ev.EventDataIdentifier = dataRef.String
-		ev.Timestamp = ts.Int64
-		ev.TimestampDesc = desc.String
-		if dateTimeJSON.Valid && dateTimeJSON.String != "" {
-			obj, err := container.DecodeJSONObject([]byte(dateTimeJSON.String))
-			if err != nil {
-				return fmt.Errorf("event %d date_time: %w", ev.Identifier, err)
-			}
-			ev.DateTime = container.ParseDateTime(obj)
-		}
-		if idf, ok := container.ParseIdentifier(ev.EventDataIdentifier); ok {
-			ev.EventData = r.eventData[idf.SequenceNumber]
-		}
-		ev.Tags = r.tagsByEvent[ev.Identifier]
-		if err := fn(&ev); err != nil {
+		raw.EventDataIdentifier = dataRef.String
+		raw.Timestamp = ts.Int64
+		raw.TimestampDesc = desc.String
+		raw.DateTimeJSON = dateTimeJSON.String
+		if err := fn(raw); err != nil {
 			return err
 		}
 	}
 	return rows.Err()
+}
+
+// Hydrate resolves a raw event into a full Event: parses date_time, resolves
+// its (preloaded) event_data, and attaches its tags. Safe for concurrent use.
+func (r *Reader) Hydrate(raw RawEvent) (*container.Event, error) {
+	ev := &container.Event{
+		Identifier:          raw.Identifier,
+		EventDataIdentifier: raw.EventDataIdentifier,
+		Timestamp:           raw.Timestamp,
+		TimestampDesc:       raw.TimestampDesc,
+		Tags:                r.tagsByEvent[raw.Identifier], // read-only map
+	}
+	if raw.DateTimeJSON != "" {
+		obj, err := container.DecodeJSONObject([]byte(raw.DateTimeJSON))
+		if err != nil {
+			return nil, fmt.Errorf("event %d date_time: %w", raw.Identifier, err)
+		}
+		ev.DateTime = container.ParseDateTime(obj)
+	}
+	if idf, ok := container.ParseIdentifier(raw.EventDataIdentifier); ok {
+		ed, err := r.GetEventData(idf.SequenceNumber)
+		if err != nil {
+			return nil, err
+		}
+		ev.EventData = ed
+	}
+	return ev, nil
+}
+
+// Each streams fully-resolved events in timestamp order, invoking fn per event.
+// Iteration stops and returns the first error fn returns.
+func (r *Reader) Each(fn func(*container.Event) error) error {
+	return r.StreamRaw(func(raw RawEvent) error {
+		ev, err := r.Hydrate(raw)
+		if err != nil {
+			return err
+		}
+		return fn(ev)
+	})
 }
