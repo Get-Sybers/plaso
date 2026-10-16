@@ -82,8 +82,12 @@ func run() error {
 		module = output.NewTLN(med)
 	case "l2ttln":
 		module = output.NewL2TTLN(med)
+	case "json_line":
+		module = output.NewJSONLine(med)
+	case "json":
+		module = output.NewJSON(med)
 	default:
-		return fmt.Errorf("unsupported output format: %q (supported: dynamic, dynamic-jsonl, null, rawpy, l2tcsv, tln, l2ttln)", *outputFormat)
+		return fmt.Errorf("unsupported output format: %q (supported: dynamic, dynamic-jsonl, null, rawpy, l2tcsv, tln, l2ttln, json_line, json)", *outputFormat)
 	}
 
 	exporter := &pipeline.Exporter{

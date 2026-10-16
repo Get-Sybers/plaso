@@ -39,6 +39,8 @@ func modules() []moduleCase {
 		{name: "tln", factory: func(m *mediator.Mediator) output.Module { return output.NewTLN(m) }, dedup: "tln.txt", all: "tln_all.txt"},
 		{name: "l2ttln", factory: func(m *mediator.Mediator) output.Module { return output.NewL2TTLN(m) }, dedup: "l2ttln.txt", all: "l2ttln_all.txt"},
 		{name: "rawpy", factory: func(m *mediator.Mediator) output.Module { return output.NewRawpy(m) }, dedup: "rawpy.txt", all: "rawpy_all.txt"},
+		{name: "json_line", factory: func(m *mediator.Mediator) output.Module { return output.NewJSONLine(m) }, dedup: "json_line.txt", all: "json_line_all.txt"},
+		{name: "json", factory: func(m *mediator.Mediator) output.Module { return output.NewJSON(m) }, dedup: "json.txt", all: "json_all.txt"},
 		{name: "null", factory: func(m *mediator.Mediator) output.Module { return output.NewNull() }, noGolden: true},
 	}
 }
