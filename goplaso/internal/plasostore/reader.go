@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
@@ -218,22 +219,24 @@ func (r *Reader) buildEventData(id int64, blob []byte) (*container.EventData, er
 	if err != nil {
 		return nil, fmt.Errorf("event_data %d: %w", id, err)
 	}
-	ed := &container.EventData{Identifier: id, Attributes: map[string]any{}}
-	for k, v := range obj {
-		switch k {
-		case "data_type":
-			ed.DataType, _ = v.(string)
-		case "_parser_chain":
-			ed.ParserChain, _ = v.(string)
-		case "_event_data_stream_identifier":
-			ed.EventDataStreamIdentifier, _ = v.(string)
-		case "_event_values_hash":
-			ed.EventValuesHash, _ = v.(string)
-		default:
-			if !reservedEventDataKeys[k] {
-				ed.Attributes[k] = v
-			}
-		}
+	// Reuse the decoded map as Attributes instead of copying into a second map
+	// (that copy was the single largest cost in the decode hot path): pull the
+	// reserved keys into typed fields, then delete them in place.
+	ed := &container.EventData{Identifier: id, Attributes: obj}
+	if v, ok := obj["data_type"].(string); ok {
+		ed.DataType = v
+	}
+	if v, ok := obj["_parser_chain"].(string); ok {
+		ed.ParserChain = v
+	}
+	if v, ok := obj["_event_data_stream_identifier"].(string); ok {
+		ed.EventDataStreamIdentifier = v
+	}
+	if v, ok := obj["_event_values_hash"].(string); ok {
+		ed.EventValuesHash = v
+	}
+	for k := range reservedEventDataKeys {
+		delete(obj, k)
 	}
 	if idf, ok := container.ParseIdentifier(ed.EventDataStreamIdentifier); ok {
 		ed.Stream = r.eventStream[idf.SequenceNumber] // read-only map
@@ -352,17 +355,24 @@ type RawEvent struct {
 	TimestampDesc       string
 }
 
-// StreamRaw streams event rows in timestamp order (ties broken by _identifier)
+// StreamRaw yields event rows in timestamp order (ties broken by _identifier)
 // without resolving event_data or parsing date_time. Iteration stops on the
 // first error fn returns.
+//
+// The rows are read with an unindexed scan and ordered in Go rather than with
+// SQL ORDER BY: plaso's schema has no index on event(timestamp), so SQLite
+// would materialize a full temporary sort b-tree every run (~10x the cost of
+// the scan itself). Sorting the lightweight rows in Go is far cheaper and keeps
+// the on-disk file untouched (read-only/immutable).
 func (r *Reader) StreamRaw(fn func(RawEvent) error) error {
 	rows, err := r.db.Query(
-		"SELECT _identifier, _event_data_identifier, date_time, timestamp, timestamp_desc " +
-			"FROM event ORDER BY timestamp, _identifier")
+		"SELECT _identifier, _event_data_identifier, date_time, timestamp, timestamp_desc FROM event")
 	if err != nil {
 		return fmt.Errorf("read event: %w", err)
 	}
 	defer rows.Close()
+
+	var all []RawEvent
 	for rows.Next() {
 		var (
 			raw          RawEvent
@@ -378,11 +388,25 @@ func (r *Reader) StreamRaw(fn func(RawEvent) error) error {
 		raw.Timestamp = ts.Int64
 		raw.TimestampDesc = desc.String
 		raw.DateTimeJSON = dateTimeJSON.String
+		all = append(all, raw)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Timestamp != all[j].Timestamp {
+			return all[i].Timestamp < all[j].Timestamp
+		}
+		return all[i].Identifier < all[j].Identifier
+	})
+
+	for _, raw := range all {
 		if err := fn(raw); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 // Hydrate resolves a raw event into a full Event: parses date_time, resolves

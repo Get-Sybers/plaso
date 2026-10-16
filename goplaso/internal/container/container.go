@@ -9,6 +9,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	// goccy/go-json decodes ~2.4x faster than encoding/json for the attribute-
+	// container blobs (the export hot path) and is a drop-in: its UseNumber
+	// yields encoding/json.Number, so large nanosecond timestamps stay exact.
+	gojson "github.com/goccy/go-json"
 )
 
 // Identifier is a plaso attribute-container identifier of the form
@@ -172,7 +177,7 @@ func toInt(v any) int {
 // so large integers (e.g. nanosecond timestamps exceeding 2^53) keep full
 // precision instead of being coerced to float64.
 func DecodeJSONObject(data []byte) (map[string]any, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
+	dec := gojson.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var m map[string]any
 	if err := dec.Decode(&m); err != nil {
@@ -183,7 +188,7 @@ func DecodeJSONObject(data []byte) (map[string]any, error) {
 
 // DecodeJSONArray unmarshals a JSON array using json.Number for all numbers.
 func DecodeJSONArray(data []byte) ([]any, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
+	dec := gojson.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var a []any
 	if err := dec.Decode(&a); err != nil {

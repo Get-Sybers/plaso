@@ -35,18 +35,38 @@ byte-identical at any worker count.
 ### Performance
 
 On a synthetic 114k-event store (4 vCPU), producing byte-identical output to
-Python `psort -o dynamic`:
+Python `psort -o dynamic` (best of 4 runs):
 
 | | time | vs Python |
 |---|---|---|
-| Python `psort` | 12.4 s | 1.0× |
-| `goplaso-psort --workers 1` | 8.3 s | 1.5× |
-| `goplaso-psort --workers 4` | 4.7 s | 2.6× |
-| `goplaso-psort --workers 8` | 4.2 s | 2.9× |
+| Python `psort` | 10.2 s | 1.0× |
+| `goplaso-psort --workers 1` | 7.5 s | 1.4× |
+| `goplaso-psort --workers 4` | 4.3 s | 2.4× |
+| `goplaso-psort --workers 8` | 3.8 s | 2.7× |
 
-Scaling is sub-linear because the SQLite `ORDER BY timestamp` scan and the
-dedup/sort/write stage are inherently serial (Amdahl's law); the parallel
-decode+format is what the worker pool accelerates.
+Scaling is sub-linear because the read and the dedup/sort/write stage are
+inherently serial (Amdahl's law); the parallel decode+format is what the worker
+pool accelerates.
+
+### Why not a different database engine?
+
+Profiling shows the bottleneck is **not** SQLite. On the 114k store, reading
+rows from SQLite is cheap — the event scan and the full `event_data` BLOB scan
+are each ~130–220 ms via the pure-Go driver. The cost is CPU **decoding the
+`event_data` blobs** (zlib inflate ≈ 1.5 s + JSON parse ≈ 1.3 s per 102k,
+plus GC pressure from the decoded maps). Any storage engine would hold the same
+zlib-compressed JSON (it's the format `log2timeline` writes), so swapping the
+engine would not move the needle — and a different *format* would break
+compatibility with the plaso toolchain unless a conversion step were added
+(only worth it if the same file is queried repeatedly).
+
+The real levers, all within the SQLite format, are: **(1)** parallel
+decode+format (done — the worker pool); **(2)** a faster JSON decoder
+(`goccy/go-json`, adopted — ~2.4× faster blob JSON, drop-in, preserves
+`json.Number` precision); **(3)** ordering in Go instead of SQL `ORDER BY`
+(done — plaso's schema has no `event(timestamp)` index, so SQL sort would
+build a temp b-tree each run). A future win is a streaming decode-and-discard
+design to cut the GC pressure from retaining every decoded event.
 
 ## Package layout
 
