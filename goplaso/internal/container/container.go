@@ -54,6 +54,7 @@ type EventData struct {
 	EventDataStreamIdentifier string // raw ref, e.g. "event_data_stream.1"
 	ParserChain               string // _parser_chain
 	DataType                  string // data_type
+	EventValuesHash           string // _event_values_hash (dedup/MACB key)
 	// Attributes holds every event-data attribute other than the reserved
 	// __type__/__container_type__/_parser_chain/data_type keys. Values keep
 	// JSON fidelity: numbers are json.Number, nested dfdatetime objects are
@@ -62,6 +63,32 @@ type EventData struct {
 
 	// Populated by the reader when joining.
 	Stream *EventDataStream
+}
+
+// CopyToDict builds the event-values map the message formatters consume,
+// mirroring plaso's EventData.CopyToDict: the public attributes plus the
+// reserved keys the formatters and their KeyError fallback reference. The
+// returned map is a fresh copy so formatter helpers may mutate it safely.
+func (e *EventData) CopyToDict() map[string]any {
+	values := make(map[string]any, len(e.Attributes)+4)
+	for k, v := range e.Attributes {
+		if v != nil {
+			values[k] = v
+		}
+	}
+	if e.DataType != "" {
+		values["data_type"] = e.DataType
+	}
+	if e.ParserChain != "" {
+		values["_parser_chain"] = e.ParserChain
+	}
+	if e.EventValuesHash != "" {
+		values["_event_values_hash"] = e.EventValuesHash
+	}
+	if e.EventDataStreamIdentifier != "" {
+		values["_event_data_stream_identifier"] = e.EventDataStreamIdentifier
+	}
+	return values
 }
 
 // Attr returns an attribute value and whether it was present.

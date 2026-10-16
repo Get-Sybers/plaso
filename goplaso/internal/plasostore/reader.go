@@ -137,6 +137,7 @@ var reservedEventDataKeys = map[string]bool{
 	"_parser_chain":                 true,
 	"data_type":                     true,
 	"_event_data_stream_identifier": true,
+	"_event_values_hash":            true,
 }
 
 func (r *Reader) loadEventData() error {
@@ -168,6 +169,8 @@ func (r *Reader) loadEventData() error {
 				ed.ParserChain, _ = v.(string)
 			case "_event_data_stream_identifier":
 				ed.EventDataStreamIdentifier, _ = v.(string)
+			case "_event_values_hash":
+				ed.EventValuesHash, _ = v.(string)
 			default:
 				if !reservedEventDataKeys[k] {
 					ed.Attributes[k] = v
