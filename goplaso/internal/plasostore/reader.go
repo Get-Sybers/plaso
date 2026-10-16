@@ -16,8 +16,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"sort"
-	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
 
@@ -39,16 +37,11 @@ type Reader struct {
 	// Small, shared, read-only after Open — safe for concurrent reads.
 	eventStream map[int64]*container.EventDataStream
 	tagsByEvent map[int64][]string
-
-	// event_data is bulk-scanned then decoded in parallel at Open and cached.
-	// After preload the cache is immutable, so reads need no lock.
-	edMu        sync.Mutex
-	edCache     map[int64]*container.EventData
-	edPreloaded bool
 }
 
 // Open opens a .plaso file read-only and loads the small related-container
-// indexes (event_data_stream, event_tag). event_data is decoded lazily.
+// indexes (event_data_stream, event_tag). Events and their event_data blobs are
+// streamed and decoded on demand (see StreamRawEvents), not held in memory.
 func Open(path string) (r *Reader, err error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
 	if err != nil {
@@ -59,14 +52,11 @@ func Open(path string) (r *Reader, err error) {
 			db.Close()
 		}
 	}()
-	// Allow the ordered streaming query and concurrent per-event point lookups
-	// to each hold their own connection (the file is opened read-only).
-	db.SetMaxOpenConns(0) // unlimited; actual concurrency is bounded by the exporter
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 
-	r = &Reader{db: db, edCache: map[int64]*container.EventData{}}
+	r = &Reader{db: db}
 	if err = r.loadMetadata(); err != nil {
 		return nil, err
 	}
@@ -80,67 +70,6 @@ func Open(path string) (r *Reader, err error) {
 		return nil, err
 	}
 	return r, nil
-}
-
-// PreloadEventData bulk-scans every event_data blob (fast serial I/O) and
-// decodes them (zlib inflate + JSON) across a worker pool, since the decode is
-// the dominant per-event cost and is independent per row. After this the cache
-// is complete and immutable, so GetEventData reads it without locking. It is
-// idempotent; workers < 1 is treated as 1 (serial decode). When not called,
-// GetEventData falls back to decoding lazily per row.
-func (r *Reader) PreloadEventData(workers int) error {
-	if r.edPreloaded {
-		return nil
-	}
-	rows, err := r.db.Query("SELECT _identifier, _data FROM event_data")
-	if err != nil {
-		return fmt.Errorf("read event_data: %w", err)
-	}
-	type rawBlob struct {
-		id   int64
-		blob []byte
-	}
-	var all []rawBlob
-	for rows.Next() {
-		var id int64
-		var blob []byte
-		if err := rows.Scan(&id, &blob); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan event_data: %w", err)
-		}
-		all = append(all, rawBlob{id: id, blob: append([]byte(nil), blob...)})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	if workers < 1 {
-		workers = 1
-	}
-	decoded := make([]*container.EventData, len(all))
-	errs := make([]error, len(all))
-	sem := make(chan struct{}, workers)
-	var wg sync.WaitGroup
-	for i := range all {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			decoded[i], errs[i] = r.buildEventData(all[i].id, all[i].blob)
-		}(i)
-	}
-	wg.Wait()
-
-	for i := range all {
-		if errs[i] != nil {
-			return errs[i]
-		}
-		r.edCache[all[i].id] = decoded[i]
-	}
-	r.edPreloaded = true
-	return nil
 }
 
 // Close releases the underlying database.
@@ -244,43 +173,6 @@ func (r *Reader) buildEventData(id int64, blob []byte) (*container.EventData, er
 	return ed, nil
 }
 
-// GetEventData returns the decoded event_data with the given sequence number
-// (rowid), decoding and caching on first use. Safe for concurrent use.
-func (r *Reader) GetEventData(seq int64) (*container.EventData, error) {
-	if r.edPreloaded {
-		// Cache is immutable after preload: read without locking.
-		return r.edCache[seq], nil
-	}
-
-	r.edMu.Lock()
-	if ed, ok := r.edCache[seq]; ok {
-		r.edMu.Unlock()
-		return ed, nil
-	}
-	r.edMu.Unlock()
-
-	// Decode outside the lock so concurrent decodes of different rows proceed
-	// in parallel (a rare duplicate decode of the same row is harmless).
-	var blob []byte
-	err := r.db.QueryRow("SELECT _data FROM event_data WHERE _identifier = ?", seq).Scan(&blob)
-	if err != nil {
-		return nil, fmt.Errorf("read event_data %d: %w", seq, err)
-	}
-	ed, err := r.buildEventData(seq, blob)
-	if err != nil {
-		return nil, err
-	}
-
-	r.edMu.Lock()
-	if cached, ok := r.edCache[seq]; ok {
-		ed = cached // keep the first stored instance
-	} else {
-		r.edCache[seq] = ed
-	}
-	r.edMu.Unlock()
-	return ed, nil
-}
-
 func (r *Reader) loadEventDataStreams() error {
 	rows, err := r.db.Query(
 		"SELECT _identifier, path_spec, md5_hash, sha1_hash, sha256_hash, file_entropy, yara_match FROM event_data_stream")
@@ -355,24 +247,28 @@ type RawEvent struct {
 	TimestampDesc       string
 }
 
-// StreamRaw yields event rows in timestamp order (ties broken by _identifier)
-// without resolving event_data or parsing date_time. Iteration stops on the
-// first error fn returns.
+// StreamRawEvents streams event rows in timestamp order (ties broken by
+// _identifier), each paired with its still-compressed event_data blob, and
+// invokes fn per row. It uses a single JOIN so events and their event_data are
+// read in one ordered pass without holding the whole store in memory: the Go
+// heap stays bounded (SQLite performs the ordering), and the expensive blob
+// decode is left to the caller so it can be parallelized and then discarded.
 //
-// The rows are read with an unindexed scan and ordered in Go rather than with
-// SQL ORDER BY: plaso's schema has no index on event(timestamp), so SQLite
-// would materialize a full temporary sort b-tree every run (~10x the cost of
-// the scan itself). Sorting the lightweight rows in Go is far cheaper and keeps
-// the on-disk file untouched (read-only/immutable).
-func (r *Reader) StreamRaw(fn func(RawEvent) error) error {
-	rows, err := r.db.Query(
-		"SELECT _identifier, _event_data_identifier, date_time, timestamp, timestamp_desc FROM event")
+// The _event_data_identifier reference ("event_data.<N>") is joined to
+// event_data by its rowid via substr/CAST. A LEFT JOIN keeps events whose
+// event_data is missing (blob is then nil). The blob passed to fn is a fresh
+// copy, safe to retain across goroutines. Iteration stops on the first error.
+func (r *Reader) StreamRawEvents(fn func(RawEvent, []byte) error) error {
+	const query = "SELECT e._identifier, e._event_data_identifier, e.date_time, " +
+		"e.timestamp, e.timestamp_desc, ed._data " +
+		"FROM event e LEFT JOIN event_data ed " +
+		"ON ed._identifier = CAST(substr(e._event_data_identifier, 12) AS INTEGER) " +
+		"ORDER BY e.timestamp, e._identifier"
+	rows, err := r.db.Query(query)
 	if err != nil {
 		return fmt.Errorf("read event: %w", err)
 	}
 	defer rows.Close()
-
-	var all []RawEvent
 	for rows.Next() {
 		var (
 			raw          RawEvent
@@ -380,38 +276,31 @@ func (r *Reader) StreamRaw(fn func(RawEvent) error) error {
 			dateTimeJSON sql.NullString
 			ts           sql.NullInt64
 			desc         sql.NullString
+			blob         []byte
 		)
-		if err := rows.Scan(&raw.Identifier, &dataRef, &dateTimeJSON, &ts, &desc); err != nil {
+		if err := rows.Scan(&raw.Identifier, &dataRef, &dateTimeJSON, &ts, &desc, &blob); err != nil {
 			return fmt.Errorf("scan event: %w", err)
 		}
 		raw.EventDataIdentifier = dataRef.String
 		raw.Timestamp = ts.Int64
 		raw.TimestampDesc = desc.String
 		raw.DateTimeJSON = dateTimeJSON.String
-		all = append(all, raw)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].Timestamp != all[j].Timestamp {
-			return all[i].Timestamp < all[j].Timestamp
+		var blobCopy []byte
+		if blob != nil {
+			blobCopy = append([]byte(nil), blob...) // stable across Next() and goroutines
 		}
-		return all[i].Identifier < all[j].Identifier
-	})
-
-	for _, raw := range all {
-		if err := fn(raw); err != nil {
+		if err := fn(raw, blobCopy); err != nil {
 			return err
 		}
 	}
-	return nil
+	return rows.Err()
 }
 
-// Hydrate resolves a raw event into a full Event: parses date_time, resolves
-// its (preloaded) event_data, and attaches its tags. Safe for concurrent use.
-func (r *Reader) Hydrate(raw RawEvent) (*container.Event, error) {
+// Hydrate resolves a raw event and its compressed event_data blob into a full
+// Event: it decodes the blob, parses date_time, and attaches tags. The decoded
+// EventData is not retained by the reader, so callers may discard the Event
+// after use. Safe for concurrent use.
+func (r *Reader) Hydrate(raw RawEvent, blob []byte) (*container.Event, error) {
 	ev := &container.Event{
 		Identifier:          raw.Identifier,
 		EventDataIdentifier: raw.EventDataIdentifier,
@@ -426,8 +315,9 @@ func (r *Reader) Hydrate(raw RawEvent) (*container.Event, error) {
 		}
 		ev.DateTime = container.ParseDateTime(obj)
 	}
-	if idf, ok := container.ParseIdentifier(raw.EventDataIdentifier); ok {
-		ed, err := r.GetEventData(idf.SequenceNumber)
+	if blob != nil {
+		idf, _ := container.ParseIdentifier(raw.EventDataIdentifier)
+		ed, err := r.buildEventData(idf.SequenceNumber, blob)
 		if err != nil {
 			return nil, err
 		}
@@ -439,8 +329,8 @@ func (r *Reader) Hydrate(raw RawEvent) (*container.Event, error) {
 // Each streams fully-resolved events in timestamp order, invoking fn per event.
 // Iteration stops and returns the first error fn returns.
 func (r *Reader) Each(fn func(*container.Event) error) error {
-	return r.StreamRaw(func(raw RawEvent) error {
-		ev, err := r.Hydrate(raw)
+	return r.StreamRawEvents(func(raw RawEvent, blob []byte) error {
+		ev, err := r.Hydrate(raw, blob)
 		if err != nil {
 			return err
 		}

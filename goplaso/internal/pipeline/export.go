@@ -1,14 +1,14 @@
-// Package pipeline implements the psort export loop: it reads events in
-// timestamp order, time-orders and deduplicates them within each equal-
-// timestamp bucket, applies the dynamic module's within-bucket textual
-// sub-sort, and writes each surviving event. Mirrors the serial core of
+// Package pipeline implements the psort export loop: it streams events in
+// timestamp order (each paired with its event_data blob), decodes and formats
+// them on a bounded worker pool, then time-orders, deduplicates, and writes
+// each surviving event. Mirrors the serial core of
 // plaso/multi_process/output_engine.py (PsortEventHeap, _FlushExportBuffer)
 // and the SortedStringHeap in plaso/output/text_file.py.
 //
-// The expensive per-event work (event_data blob inflate + JSON decode, and
-// message formatting) is independent across events, so it can run on a bounded
-// worker pool while the ordered reader and the serial dedup/sort/write stage
-// preserve byte-identical output.
+// Events and their event_data are streamed and decoded on demand, then
+// discarded once formatted, so the Go heap stays bounded regardless of store
+// size: only the in-flight worker window and the current equal-timestamp bucket
+// are held, never every decoded event.
 package pipeline
 
 import (
@@ -16,6 +16,7 @@ import (
 	"io"
 	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
 	"github.com/Get-Sybers/plaso/goplaso/internal/output"
@@ -43,10 +44,32 @@ type Exporter struct {
 	Workers int
 }
 
-// processed is a hydrated event with its computed output record.
+// processed is one event reduced to just what the ordering/dedup/write stage
+// needs: precomputed strings and the dedup/sort keys. The output line and sort
+// key are built here (in the worker), so the serial sink only compares and
+// writes them; the heavy decoded EventData and Record are not retained.
 type processed struct {
-	ev  *container.Event
-	rec *output.Record
+	sortKey string // within-bucket textual sub-sort key
+	out     string // the exact line to write (CSV or JSON)
+	hash    string
+	desc    string
+	id      int64
+	ts      int64
+}
+
+func reduce(ev *container.Event, rec *output.Record, mode Mode) processed {
+	out := rec.CSVLine()
+	if mode == ModeJSONL {
+		out = rec.JSONLine()
+	}
+	return processed{
+		sortKey: rec.SortKey(),
+		out:     out,
+		hash:    hashOf(ev),
+		desc:    ev.TimestampDesc,
+		id:      ev.Identifier,
+		ts:      ev.Timestamp,
+	}
 }
 
 // Export writes all events to w.
@@ -60,18 +83,11 @@ func (e *Exporter) Export(w io.Writer) error {
 		}
 	}
 
-	s := &sink{bw: bw, mode: e.Mode, dedup: e.Dedup, dyn: e.Dynamic}
+	s := &sink{bw: bw, dedup: e.Dedup}
 
 	workers := e.Workers
 	if workers == 0 {
 		workers = runtime.NumCPU()
-	}
-
-	// Decode every event_data blob up front, in parallel at the chosen width
-	// (this is the dominant per-event cost). With workers==1 this is a serial
-	// decode, giving a meaningful serial-vs-parallel comparison.
-	if err := e.Reader.PreloadEventData(workers); err != nil {
-		return err
 	}
 
 	var err error
@@ -91,59 +107,95 @@ func (e *Exporter) Export(w io.Writer) error {
 
 // exportSerial hydrates and formats each event inline, in order.
 func (e *Exporter) exportSerial(s *sink) error {
-	return e.Reader.StreamRaw(func(raw plasostore.RawEvent) error {
-		ev, err := e.Reader.Hydrate(raw)
+	return e.Reader.StreamRawEvents(func(raw plasostore.RawEvent, blob []byte) error {
+		ev, err := e.Reader.Hydrate(raw, blob)
 		if err != nil {
 			return err
 		}
-		return s.add(processed{ev: ev, rec: e.Dynamic.Compute(ev)})
+		return s.add(reduce(ev, e.Dynamic.Compute(ev), e.Mode))
 	})
 }
 
-type procResult struct {
-	ev  *container.Event
-	rec *output.Record
-	err error
-}
-
-// exportParallel hydrates and formats events on a bounded worker pool while a
-// queue of per-event result channels preserves the reader's timestamp order.
+// exportParallel decodes+formats events on a fixed worker pool. The reader
+// streams jobs in timestamp order; workers process them concurrently and tag
+// each result with its sequence number; a collector reassembles results into
+// timestamp order (a small reorder buffer) before feeding the serial sink. A
+// fixed pool with two channels avoids allocating a goroutine and channel per
+// event, which otherwise swamps the scheduler on large stores.
 func (e *Exporter) exportParallel(s *sink, workers int) error {
-	sem := make(chan struct{}, workers)
-	futures := make(chan chan procResult, workers*2)
+	type job struct {
+		seq  int64
+		raw  plasostore.RawEvent
+		blob []byte
+	}
+	type res struct {
+		seq int64
+		p   processed
+		err error
+	}
+	jobs := make(chan job, workers*4)
+	results := make(chan res, workers*4)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				ev, err := e.Reader.Hydrate(j.raw, j.blob)
+				if err != nil {
+					results <- res{seq: j.seq, err: err}
+					continue
+				}
+				results <- res{seq: j.seq, p: reduce(ev, e.Dynamic.Compute(ev), e.Mode)}
+			}
+		}()
+	}
 
 	var produceErr error
 	go func() {
-		defer close(futures)
-		produceErr = e.Reader.StreamRaw(func(raw plasostore.RawEvent) error {
-			ch := make(chan procResult, 1)
-			futures <- ch
-			sem <- struct{}{}
-			go func(raw plasostore.RawEvent, ch chan procResult) {
-				defer func() { <-sem }()
-				ev, err := e.Reader.Hydrate(raw)
-				if err != nil {
-					ch <- procResult{err: err}
-					return
-				}
-				ch <- procResult{ev: ev, rec: e.Dynamic.Compute(ev)}
-			}(raw, ch)
+		defer close(jobs)
+		var seq int64
+		produceErr = e.Reader.StreamRawEvents(func(raw plasostore.RawEvent, blob []byte) error {
+			jobs <- job{seq: seq, raw: raw, blob: blob}
+			seq++
 			return nil
 		})
 	}()
 
+	go func() { wg.Wait(); close(results) }()
+
+	// Reassemble into sequence order and feed the sink.
+	pending := make(map[int64]processed)
+	pendErr := make(map[int64]error)
+	var next int64
 	var firstErr error
-	for ch := range futures {
-		r := <-ch
-		if firstErr != nil {
-			continue // keep draining so workers finish and the producer unblocks
-		}
+	for r := range results {
 		if r.err != nil {
-			firstErr = r.err
-			continue
+			pendErr[r.seq] = r.err
+		} else {
+			pending[r.seq] = r.p
 		}
-		if err := s.add(processed{ev: r.ev, rec: r.rec}); err != nil {
-			firstErr = err
+		for {
+			if err, ok := pendErr[next]; ok {
+				delete(pendErr, next)
+				if firstErr == nil {
+					firstErr = err
+				}
+				next++
+				continue
+			}
+			p, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			if firstErr == nil {
+				if err := s.add(p); err != nil {
+					firstErr = err
+				}
+			}
+			next++
 		}
 	}
 	if firstErr != nil {
@@ -156,9 +208,7 @@ func (e *Exporter) exportParallel(s *sink, workers int) error {
 // each bucket (dedup + within-bucket textual sub-sort) to the writer.
 type sink struct {
 	bw    *bufio.Writer
-	mode  Mode
 	dedup bool
-	dyn   *output.Dynamic
 
 	bucket   []processed
 	bucketTS int64
@@ -166,13 +216,13 @@ type sink struct {
 }
 
 func (s *sink) add(p processed) error {
-	if s.started && p.ev.Timestamp != s.bucketTS {
+	if s.started && p.ts != s.bucketTS {
 		if err := s.flush(); err != nil {
 			return err
 		}
 		s.bucket = s.bucket[:0]
 	}
-	s.bucketTS = p.ev.Timestamp
+	s.bucketTS = p.ts
 	s.started = true
 	s.bucket = append(s.bucket, p)
 	return nil
@@ -193,15 +243,14 @@ func (s *sink) flush() error {
 	// broken by identifier for determinism (plaso breaks them on duplicate
 	// content, which is then discarded anyway).
 	sort.SliceStable(bucket, func(i, j int) bool {
-		a, b := bucket[i].ev, bucket[j].ev
-		ha, hb := hashOf(a), hashOf(b)
-		if ha != hb {
-			return ha < hb
+		a, b := bucket[i], bucket[j]
+		if a.hash != b.hash {
+			return a.hash < b.hash
 		}
-		if a.TimestampDesc != b.TimestampDesc {
-			return a.TimestampDesc < b.TimestampDesc
+		if a.desc != b.desc {
+			return a.desc < b.desc
 		}
-		return a.Identifier < b.Identifier
+		return a.id < b.id
 	})
 
 	// Deduplicate against the immediately-preceding kept event (same
@@ -210,33 +259,25 @@ func (s *sink) flush() error {
 	var lastDesc, lastHash string
 	hasPrev := false
 	for _, p := range bucket {
-		h := hashOf(p.ev)
-		if s.dedup && hasPrev && p.ev.TimestampDesc == lastDesc && h == lastHash {
+		if s.dedup && hasPrev && p.desc == lastDesc && p.hash == lastHash {
 			continue
 		}
 		survivors = append(survivors, p)
-		lastDesc, lastHash = p.ev.TimestampDesc, h
+		lastDesc, lastHash = p.desc, p.hash
 		hasPrev = true
 	}
 
 	// Dynamic module textual sub-sort: ascending by (sort key, output line),
-	// matching the SortedStringHeap.
+	// matching the SortedStringHeap. Keys were precomputed by the workers.
 	sort.SliceStable(survivors, func(i, j int) bool {
-		ki, kj := survivors[i].rec.SortKey(), survivors[j].rec.SortKey()
-		if ki != kj {
-			return ki < kj
+		if survivors[i].sortKey != survivors[j].sortKey {
+			return survivors[i].sortKey < survivors[j].sortKey
 		}
-		return survivors[i].rec.CSVLine() < survivors[j].rec.CSVLine()
+		return survivors[i].out < survivors[j].out
 	})
 
 	for _, p := range survivors {
-		var err error
-		if s.mode == ModeCSV {
-			_, err = s.bw.WriteString(p.rec.CSVLine())
-		} else {
-			_, err = s.bw.WriteString(p.rec.JSONLine())
-		}
-		if err != nil {
+		if _, err := s.bw.WriteString(p.out); err != nil {
 			return err
 		}
 	}

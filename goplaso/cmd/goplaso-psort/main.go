@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/formatters"
 	"github.com/Get-Sybers/plaso/goplaso/internal/mediator"
@@ -34,8 +35,15 @@ func run() error {
 		dataLocation = flag.String("data_location", "", "plaso data directory (contains formatters/)")
 		includeAll   = flag.Bool("a", false, "include all events (disable deduplication)")
 		workers      = flag.Int("workers", 0, "decode/format worker count (0=NumCPU, 1=serial)")
+		gcPercent    = flag.Int("gc_percent", 400, "Go GC target percent; higher trades memory for speed, -1 disables GC")
 	)
 	flag.Parse()
+
+	// The export decodes and discards events in a tight loop, so the live heap
+	// stays small and the default GC (100) fires very frequently, stalling the
+	// workers. A higher target lets the heap breathe for a large throughput win
+	// at a modest, still-bounded memory cost (streaming keeps the live set small).
+	debug.SetGCPercent(*gcPercent)
 
 	if flag.NArg() < 1 {
 		return fmt.Errorf("missing storage file (usage: goplaso-psort [-o FORMAT] [-w OUT] STORAGE.plaso)")
