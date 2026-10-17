@@ -22,6 +22,9 @@ func NewRawpy(med *mediator.Mediator) *Rawpy {
 	return &Rawpy{fc: NewFieldComputer(med)}
 }
 
+// rawpyRowSeparator is the "+-"×40 record separator, built once.
+var rawpyRowSeparator = strings.Repeat("+-", 40)
+
 // rawpyReservedFields mirrors NativePythonOutputModule._RESERVED_FIELDS.
 var rawpyReservedFields = map[string]bool{
 	"body": true, "data_type": true, "date_time": true, "display_name": true,
@@ -86,7 +89,7 @@ func (m *Rawpy) Prepare(ev *container.Event) *Unit {
 		}
 	}
 
-	lines := []string{strings.Repeat("+-", 40), "[Timestamp]:", "  " + timestampISO}
+	lines := []string{rawpyRowSeparator, "[Timestamp]:", "  " + timestampISO}
 	if pathSpec != nil {
 		lines = append(lines, "", "[Pathspec]:")
 		for _, l := range strings.Split(pathSpec.Comparable(), "\n") {

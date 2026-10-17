@@ -91,13 +91,23 @@ The real levers, all within the SQLite format, applied here:
   the parallel speedup.
 - **`goccy/go-json`** for the blob JSON (~2.4× faster than `encoding/json`,
   drop-in, preserves `json.Number` precision for nanosecond timestamps).
-- **Pooled zlib readers + decode straight from the inflate stream.** Each
-  `zlib.NewReader` allocates a fresh ~32 KiB flate window; recycling the readers
-  (`sync.Pool` + `Resetter.Reset`) and decoding the JSON directly off the stream
-  (instead of `io.ReadAll` into a second full buffer) cut per-event allocation
-  ~80% (≈9.4→1.8 GB over a 155k-event run) and GC pressure with it — a further
-  ~1.6× on the parallel hot path, with byte-identical output. GC was the
-  cross-worker bottleneck, so cutting allocations helps parallel most.
+- **Allocation/GC reduction on the per-event path** — a set of byte-identical
+  changes that cut per-event allocation ~84% (≈9.4→1.5 GB over a 155k-event run)
+  and the GC pressure with it, for ~1.4–1.8× end-to-end (most on parallel runs,
+  where GC assists were the cross-worker bottleneck, and most on the
+  wider-field modules like l2tcsv):
+  - Pool the zlib readers (`sync.Pool` + `Resetter.Reset`) instead of a fresh
+    `zlib.NewReader` per blob (each allocated a ~32 KiB flate window — the single
+    largest allocation source), and decode the JSON straight off the inflate
+    stream rather than `io.ReadAll`-ing into a second full buffer.
+  - Parse each stream's `path_spec` once at load and cache it, instead of
+    re-decoding the same JSON on every event that shares the stream
+    (display_name, l2tcsv filename+extra, json pathspec).
+  - Drop two redundant per-event copies (the `database/sql`-cloned blob is
+    already caller-owned; decode `date_time` straight from its string), fold the
+    DSV field sanitizer into one pass, pre-size the line/sort-key builders,
+    memoize the formatter's format-string attribute set, and sort the
+    equal-timestamp bucket with `slices.SortStableFunc`.
 
 ## Package layout
 

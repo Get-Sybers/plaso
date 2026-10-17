@@ -111,6 +111,9 @@ type Formatter struct {
 	shortPieceAttrs []string // lazy
 	mapsOnce        sync.Once
 	buildErr        error
+
+	attrNames     map[string]bool // cached GetFormatStringAttributeNames result
+	attrNamesOnce sync.Once
 }
 
 // SourceMapping returns (short, long).

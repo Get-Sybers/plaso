@@ -12,6 +12,13 @@ type kv struct {
 	value any
 }
 
+// streamPathSpec returns the stream's path specification, parsed once by the
+// reader and cached on the stream (nil when absent or unparsable).
+func streamPathSpec(s *container.EventDataStream) *dfpath.PathSpec {
+	ps, _ := s.ParsedPathSpec.(*dfpath.PathSpec)
+	return ps
+}
+
 // eventDataAttributes yields the public event-data attributes plus the
 // _parser_chain protected attribute, skipping date/time values, mirroring the
 // acstore GetAttributes iteration the rawpy, l2tcsv-extra and JSON modules
@@ -54,8 +61,7 @@ func eventDataStreamAttributes(s *container.EventDataStream) []kv {
 		out = append(out, kv{name: "sha256_hash", value: s.SHA256Hash})
 	}
 	if s.PathSpec != "" {
-		ps, _ := dfpath.Parse(s.PathSpec)
-		out = append(out, kv{name: "path_spec", value: ps})
+		out = append(out, kv{name: "path_spec", value: streamPathSpec(s)})
 	}
 	if s.YaraMatch != "" {
 		out = append(out, kv{name: "yara_match", value: s.YaraMatch})

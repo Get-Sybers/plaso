@@ -16,9 +16,11 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
+	"github.com/Get-Sybers/plaso/goplaso/internal/dfpath"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (registers "sqlite")
 )
@@ -215,6 +217,14 @@ func (r *Reader) loadEventDataStreams() error {
 		s.SHA256Hash = sha256.String
 		s.FileEntropy = entropy.String
 		s.YaraMatch = yara.String
+		// Parse the path specification once here (there are few streams relative
+		// to events), so the output modules reuse it instead of re-decoding the
+		// same JSON on every event that shares the stream.
+		if s.PathSpec != "" {
+			if ps, err := dfpath.Parse(s.PathSpec); err == nil {
+				s.ParsedPathSpec = ps
+			}
+		}
 		r.eventStream[s.Identifier] = s
 	}
 	return rows.Err()
@@ -307,11 +317,10 @@ func (r *Reader) StreamRawEvents(fn func(RawEvent, []byte) error) error {
 		raw.Timestamp = ts.Int64
 		raw.TimestampDesc = desc.String
 		raw.DateTimeJSON = dateTimeJSON.String
-		var blobCopy []byte
-		if blob != nil {
-			blobCopy = append([]byte(nil), blob...) // stable across Next() and goroutines
-		}
-		if err := fn(raw, blobCopy); err != nil {
+		// database/sql.Rows.Scan into a *[]byte stores a fresh caller-owned copy
+		// (valid indefinitely, stable across Next), so blob is already private to
+		// this row and safe to hand to a worker goroutine without a second copy.
+		if err := fn(raw, blob); err != nil {
 			return err
 		}
 	}
@@ -331,7 +340,9 @@ func (r *Reader) Hydrate(raw RawEvent, blob []byte) (*container.Event, error) {
 		Tags:                r.tagsByEvent[raw.Identifier], // read-only map
 	}
 	if raw.DateTimeJSON != "" {
-		obj, err := container.DecodeJSONObject([]byte(raw.DateTimeJSON))
+		// Decode from the string directly (strings.NewReader) to avoid the
+		// []byte(string) copy on every event.
+		obj, err := container.DecodeJSONObjectFrom(strings.NewReader(raw.DateTimeJSON))
 		if err != nil {
 			return nil, fmt.Errorf("event %d date_time: %w", raw.Identifier, err)
 		}

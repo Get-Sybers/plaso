@@ -57,13 +57,12 @@ func hashOf(ev *container.Event) string {
 	return "UNKNOWN"
 }
 
-// sanitizeDSV mirrors DSVEventFormattingHelper._SanitizeField.
-func sanitizeDSV(field, delim string) string {
-	if delim != "" {
-		field = strings.ReplaceAll(field, delim, " ")
-	}
-	field = strings.ReplaceAll(field, "\r", " ")
-	field = strings.ReplaceAll(field, "\n", " ")
+// sanitizeDSV mirrors DSVEventFormattingHelper._SanitizeField. The whitespace
+// fold (delimiter/CR/LF → space) is done in one pass by a pre-built replacer:
+// all three map distinct single bytes to a space, and a space is never itself a
+// match target, so one pass is byte-identical to three sequential ReplaceAlls.
+func sanitizeDSV(field string, folder *strings.Replacer) string {
+	field = folder.Replace(field)
 	if len(field) > 1 {
 		switch field[0] {
 		case '=', '+', '-', '@':

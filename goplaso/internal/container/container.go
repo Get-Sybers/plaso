@@ -122,6 +122,12 @@ type EventDataStream struct {
 	SHA256Hash  string
 	FileEntropy string
 	YaraMatch   string
+
+	// ParsedPathSpec caches the decoded PathSpec, parsed once by the reader when
+	// the stream is loaded (before any worker goroutine exists) and shared
+	// read-only across workers. Typed as any to avoid a container→dfpath import
+	// cycle; it holds a *dfpath.PathSpec (nil when PathSpec is empty).
+	ParsedPathSpec any
 }
 
 // DateTimeValues is a decoded dfdatetime value. ClassName discriminates the
