@@ -496,10 +496,18 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
         if self._event_tags is None:
             self._event_tags = {}
             for event_tag in storage_reader.GetAttributeContainers("event_tag"):
-                lookup_key = event_tag.GetEventIdentifier().CopyToString()
+                lookup_key = event_tag.GetEventIdentifier().sequence_number
                 self._event_tags.setdefault(lookup_key, event_tag)
 
-        return self._event_tags.get(event.GetIdentifier().CopyToString())
+        # Short-circuit stores without any event tags so untagged events do not
+        # pay for a lookup key per event. Key the dictionary by the integer
+        # sequence number of the event identifier instead of formatting an
+        # "event.<n>" string per event; event tags always reference events, so
+        # the sequence number identifies the event unambiguously.
+        if not self._event_tags:
+            return None
+
+        return self._event_tags.get(event.GetIdentifier().sequence_number)
 
     def _ReadMessageFormatters(
         self, output_mediator_object, data_location, custom_formatters_path

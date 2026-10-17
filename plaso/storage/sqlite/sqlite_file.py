@@ -153,6 +153,44 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
                 raise OSError(f"Unable to query storage file with error: {exception!s}")
 
+    def _CacheAttributeContainerByIndex(self, attribute_container, index):
+        """Caches a specific attribute container.
+
+        Overrides the base implementation to key the read cache by a
+        (container_type, index) tuple instead of formatting a
+        "<container_type>.<index>" string on every cache insertion.
+
+        Args:
+          attribute_container (AttributeContainer): attribute container.
+          index (int): attribute container index.
+        """
+        if len(self._attribute_container_cache) >= self._MAXIMUM_CACHED_CONTAINERS:
+            self._attribute_container_cache.popitem(last=True)
+
+        lookup_key = (attribute_container.CONTAINER_TYPE, index)
+        self._attribute_container_cache[lookup_key] = attribute_container
+        self._attribute_container_cache.move_to_end(lookup_key, last=False)
+
+    def _GetCachedAttributeContainer(self, container_type, index):
+        """Retrieves a specific cached attribute container.
+
+        Overrides the base implementation to key the read cache by a
+        (container_type, index) tuple instead of formatting a
+        "<container_type>.<index>" string on every lookup.
+
+        Args:
+          container_type (str): attribute container type.
+          index (int): attribute container index.
+
+        Returns:
+          AttributeContainer: attribute container or None if not available.
+        """
+        lookup_key = (container_type, index)
+        attribute_container = self._attribute_container_cache.get(lookup_key)
+        if attribute_container:
+            self._attribute_container_cache.move_to_end(lookup_key, last=False)
+        return attribute_container
+
     def _DeserializeAttributeContainer(self, container_type, serialized_data):
         """Deserializes an attribute container.
 
