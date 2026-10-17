@@ -58,8 +58,10 @@ class OutputMediator:
         self._language_tag = None
         self._lcid = None
         self._message_formatters = {}
+        self._message_formatter_by_data_type = {}
         self._preferred_encoding = preferred_encoding
         self._source_mappings = {}
+        self._source_mapping_by_data_type = {}
         self._storage_reader = storage_reader
         self._system_configurations = None
         self._time_zone = None
@@ -96,6 +98,13 @@ class OutputMediator:
           KeyError: if the message formatter is already set for the corresponding
               data type and override existing is False.
         """
+        # The per-data-type resolution caches are derived from the message
+        # formatters and source mappings, so invalidate them whenever the set
+        # of formatters changes. In practice formatters are only loaded during
+        # setup, before any event is formatted.
+        self._message_formatter_by_data_type = {}
+        self._source_mapping_by_data_type = {}
+
         message_formatters_file = yaml_formatters_file.YAMLFormattersFile()
         for message_formatter in message_formatters_file.ReadFromFile(path):
             if (
@@ -320,8 +329,14 @@ class OutputMediator:
           EventFormatter: corresponding message formatter or the default message
               formatter if not available.
         """
-        data_type = data_type.lower()
-        return self._message_formatters.get(data_type)
+        # Cache the resolution per data type so the lowercasing and dictionary
+        # lookup run once per distinct data type instead of once per event.
+        message_formatter = self._message_formatter_by_data_type.get(data_type, False)
+        if message_formatter is False:
+            message_formatter = self._message_formatters.get(data_type.lower())
+            self._message_formatter_by_data_type[data_type] = message_formatter
+
+        return message_formatter
 
     def GetRelativePathForPathSpec(self, path_spec):
         """Retrieves the relative path for a path specification.
@@ -344,8 +359,14 @@ class OutputMediator:
           tuple[str, str]: short and (long) source mappings or (None, None) if not
               available.
         """
-        data_type = data_type.lower()
-        return self._source_mappings.get(data_type, (None, None))
+        # Cache the resolution per data type so the lowercasing and dictionary
+        # lookup run once per distinct data type instead of once per event.
+        source_mapping = self._source_mapping_by_data_type.get(data_type)
+        if source_mapping is None:
+            source_mapping = self._source_mappings.get(data_type.lower(), (None, None))
+            self._source_mapping_by_data_type[data_type] = source_mapping
+
+        return source_mapping
 
     def GetUsername(self, event_data, default_username="-"):
         """Retrieves the username related to the event data.
