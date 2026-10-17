@@ -43,6 +43,10 @@ class FieldFormattingHelper:
     # Maps the name of a field to callback function that formats the field value.
     _FIELD_FORMAT_CALLBACKS = {}
 
+    # Sentinel cached when determining the output time zone name failed, to
+    # distinguish it from a successfully determined name.
+    _TIME_ZONE_NAME_ERROR = object()
+
     def __init__(self):
         """Initializes a field formatting helper."""
         event_data_stream = events.EventDataStream()
@@ -62,6 +66,16 @@ class FieldFormattingHelper:
         self._cached_message_formatter = None
         self._cached_message_event_values = None
 
+        # Last-value caches of the most recent conversion of a UTC wall-clock
+        # second to the output time zone. Events are formatted in timestamp
+        # order, so these capture the repeated conversions for the date, time
+        # and time-zone fields of a single event and across consecutive events
+        # in the same second, using constant memory.
+        self._datetime_in_time_zone_key = None
+        self._datetime_in_time_zone = None
+        self._time_zone_name_key = None
+        self._time_zone_name = None
+
         for field_name, callback_name in self._FIELD_FORMAT_CALLBACKS.items():
             if callback_name == "_FormatTag":
                 self._event_tag_field_names.append(field_name)
@@ -69,6 +83,83 @@ class FieldFormattingHelper:
                 self._callback_functions[field_name] = getattr(
                     self, callback_name, None
                 )
+
+    def _CopyDateTimeToTimeZone(
+        self, output_mediator, year, month, day_of_month, hours, minutes, seconds
+    ):
+        """Converts a UTC date and time of day to the output time zone.
+
+        The most recent conversion is cached. Because events are formatted in
+        chronological order, a given second is converted once even though it is
+        requested for both the date and time fields of an event and for
+        consecutive events within the same second.
+
+        Args:
+          output_mediator (OutputMediator): mediates interactions between output
+              modules and other components, such as storage and dfVFS.
+          year (int): year.
+          month (int): month.
+          day_of_month (int): day of month.
+          hours (int): hours.
+          minutes (int): minutes.
+          seconds (int): seconds.
+
+        Returns:
+          datetime.datetime: date and time of day in the output time zone or
+              None if the conversion failed.
+        """
+        lookup_key = (year, month, day_of_month, hours, minutes, seconds)
+        if lookup_key != self._datetime_in_time_zone_key:
+            self._datetime_in_time_zone_key = lookup_key
+            try:
+                datetime_object = datetime.datetime(
+                    year, month, day_of_month, hours, minutes, seconds, tzinfo=pytz.UTC
+                )
+                self._datetime_in_time_zone = datetime_object.astimezone(
+                    output_mediator.time_zone
+                )
+            except (OSError, OverflowError, TypeError, ValueError):
+                self._datetime_in_time_zone = None
+
+        return self._datetime_in_time_zone
+
+    def _GetOutputTimeZoneName(
+        self, output_mediator, year, month, day_of_month, hours, minutes, seconds
+    ):
+        """Retrieves the output time zone name for a UTC date and time of day.
+
+        The most recent result is cached, see _CopyDateTimeToTimeZone.
+
+        Args:
+          output_mediator (OutputMediator): mediates interactions between output
+              modules and other components, such as storage and dfVFS.
+          year (int): year.
+          month (int): month.
+          day_of_month (int): day of month.
+          hours (int): hours.
+          minutes (int): minutes.
+          seconds (int): seconds.
+
+        Returns:
+          object: time zone name or the _TIME_ZONE_NAME_ERROR sentinel if it
+              could not be determined.
+        """
+        lookup_key = (year, month, day_of_month, hours, minutes, seconds)
+        if lookup_key != self._time_zone_name_key:
+            self._time_zone_name_key = lookup_key
+            try:
+                # For tzname to work the datetime object must be naive (without
+                # a time zone).
+                datetime_object = datetime.datetime(
+                    year, month, day_of_month, hours, minutes, seconds
+                )
+                self._time_zone_name = output_mediator.time_zone.tzname(
+                    datetime_object
+                )
+            except (OverflowError, TypeError, ValueError):
+                self._time_zone_name = self._TIME_ZONE_NAME_ERROR
+
+        return self._time_zone_name
 
     # The field format callback methods require specific arguments hence
     # the check for unused arguments is disabled here.
@@ -488,19 +579,17 @@ class FieldFormattingHelper:
         )
 
         if output_mediator.time_zone != pytz.UTC:
-            try:
-                datetime_object = datetime.datetime(
-                    year, month, day_of_month, hours, minutes, seconds, tzinfo=pytz.UTC
-                )
-                datetime_object = datetime_object.astimezone(output_mediator.time_zone)
-
+            datetime_object = self._CopyDateTimeToTimeZone(
+                output_mediator, year, month, day_of_month, hours, minutes, seconds
+            )
+            if datetime_object is None:
+                hours, minutes, seconds = (None, None, None)
+            else:
                 hours, minutes, seconds = (
                     datetime_object.hour,
                     datetime_object.minute,
                     datetime_object.second,
                 )
-            except (OSError, OverflowError, TypeError, ValueError):
-                hours, minutes, seconds = (None, None, None)
 
         if None in (hours, minutes, seconds):
             message = (
@@ -541,15 +630,10 @@ class FieldFormattingHelper:
         year, month, day_of_month, hours, minutes, seconds = (
             date_time.GetDateWithTimeOfDay()
         )
-        try:
-            # For tzname to work the datetime object must be naive (without
-            # a time zone).
-            datetime_object = datetime.datetime(
-                year, month, day_of_month, hours, minutes, seconds
-            )
-            return output_mediator.time_zone.tzname(datetime_object)
-
-        except (OverflowError, TypeError, ValueError):
+        time_zone_name = self._GetOutputTimeZoneName(
+            output_mediator, year, month, day_of_month, hours, minutes, seconds
+        )
+        if time_zone_name is self._TIME_ZONE_NAME_ERROR:
             message = (
                 f"unable to copy timestamp: {event.timestamp!s} to a human readable "
                 f'time zone. Defaulting to: "-"'
@@ -557,6 +641,8 @@ class FieldFormattingHelper:
             self._ReportEventError(event, event_data, message)
 
             return "-"
+
+        return time_zone_name
 
     def _FormatUsername(self, output_mediator, event, event_data, event_data_stream):
         """Formats an username field.
