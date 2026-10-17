@@ -4,7 +4,6 @@ For documentation on the L2T CSV format see:
   https://forensics.wiki/l2t_csv
 """
 
-import datetime
 import pytz
 
 from acstore.containers import interface as containers_interface
@@ -155,18 +154,15 @@ class L2TCSVFieldFormattingHelper(formatting_helper.FieldFormattingHelper):
             date_time.GetDateWithTimeOfDay()
         )
         if output_mediator.time_zone != pytz.UTC:
-            try:
-                datetime_object = datetime.datetime(
-                    year, month, day_of_month, hours, minutes, seconds, tzinfo=pytz.UTC
-                )
-                datetime_object = datetime_object.astimezone(output_mediator.time_zone)
-
+            datetime_object = self._CopyDateTimeToTimeZone(
+                output_mediator, year, month, day_of_month, hours, minutes, seconds
+            )
+            if datetime_object is None:
+                year, month, day_of_month = (None, None, None)
+            else:
                 year = datetime_object.year
                 month = datetime_object.month
                 day_of_month = datetime_object.day
-
-            except (OSError, OverflowError, TypeError, ValueError):
-                year, month, day_of_month = (None, None, None)
 
         if None in (year, month, day_of_month):
             message = (
