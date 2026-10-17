@@ -16,7 +16,8 @@ import (
 	"bufio"
 	"io"
 	"runtime"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/output"
@@ -201,12 +202,11 @@ func (b *bucketer) finish() error {
 // sort — then deduplicate and MACB-group, emitting to the sink.
 func (b *bucketer) flush() error {
 	bucket := b.bucket
-	sort.SliceStable(bucket, func(i, j int) bool {
-		a, c := bucket[i], bucket[j]
+	slices.SortStableFunc(bucket, func(a, c *output.Unit) int {
 		if a.Hash != c.Hash {
-			return a.Hash < c.Hash
+			return strings.Compare(a.Hash, c.Hash)
 		}
-		return a.Desc < c.Desc
+		return strings.Compare(a.Desc, c.Desc)
 	})
 
 	var group []*output.Unit

@@ -45,6 +45,15 @@ func fromMap(m map[string]any) *PathSpec {
 	return ps
 }
 
+// Raw returns the decoded path-specification object (the serialized-dict form
+// the JSON output modules emit). It is read-only; callers must not mutate it.
+func (p *PathSpec) Raw() map[string]any {
+	if p == nil {
+		return nil
+	}
+	return p.raw
+}
+
 // DisplayName derives the human-readable display name, e.g. "OS:/path/to/file".
 // For the first slice this covers the flat (parent-less) case byte-exactly;
 // nested specs (images, VSS, compressed streams) are refined in a later

@@ -72,7 +72,7 @@ func (m *JSONModule) fieldValues(ev *container.Event) map[string]any {
 				value := a.value
 				if name == "path_spec" {
 					name = "pathspec"
-					value = pathSpecDict(ed.Stream.PathSpec)
+					value = pathSpecDict(ed.Stream)
 				}
 				fv[name] = value
 			}
@@ -181,18 +181,16 @@ func numberNonZero(v any) bool {
 	return false
 }
 
-// pathSpecDict decodes a serialized path specification into the dict form the
-// JSON serializer emits. For the flat specs psort reads, the stored form is the
-// serialized form.
-func pathSpecDict(serialized string) any {
-	if serialized == "" {
+// pathSpecDict returns the path specification in the dict form the JSON
+// serializer emits. For the flat specs psort reads, the stored form is the
+// serialized form, which is exactly the map the cached PathSpec already holds,
+// so this reuses it rather than re-decoding the JSON per event.
+func pathSpecDict(s *container.EventDataStream) any {
+	ps := streamPathSpec(s)
+	if ps == nil {
 		return nil
 	}
-	obj, err := container.DecodeJSONObject([]byte(serialized))
-	if err != nil {
-		return nil
-	}
-	return obj
+	return ps.Raw()
 }
 
 // --- json_line sink ----------------------------------------------------------

@@ -28,14 +28,20 @@ func (f *Formatter) GetMessageShort(values map[string]any) string {
 // GetFormatStringAttributeNames returns the set of attribute names referenced by
 // the (long) message format string, mirroring
 // EventFormatter.GetFormatStringAttributeNames (used by l2tcsv's extra field).
+// The result is constant per formatter, so it is computed once and shared; the
+// returned map is read-only and callers copy any names they need into their own
+// set, so concurrent read access from the worker pool is safe.
 func (f *Formatter) GetFormatStringAttributeNames() map[string]bool {
-	names := map[string]bool{}
-	for _, piece := range f.messagePieces {
-		for _, m := range formatStringAttributeNameRE.FindAllStringSubmatch(piece, -1) {
-			names[m[1]] = true
+	f.attrNamesOnce.Do(func() {
+		names := map[string]bool{}
+		for _, piece := range f.messagePieces {
+			for _, m := range formatStringAttributeNameRE.FindAllStringSubmatch(piece, -1) {
+				names[m[1]] = true
+			}
 		}
-	}
-	return names
+		f.attrNames = names
+	})
+	return f.attrNames
 }
 
 // truncateShort applies the Python len>80 → [:77]+"..." rule using rune counts.

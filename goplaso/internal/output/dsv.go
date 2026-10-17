@@ -21,6 +21,7 @@ type DSV struct {
 	sortIdx  []int
 	collapse bool
 	jsonl    bool // dynamic-as-JSONL deliverable (not a plaso module)
+	folder   *strings.Replacer
 }
 
 type fieldDef struct {
@@ -30,6 +31,7 @@ type fieldDef struct {
 
 func newDSV(fc *FieldComputer, defs []fieldDef, delim, header string, sortNames []string) *DSV {
 	d := &DSV{fc: fc, delim: delim, header: header}
+	d.folder = strings.NewReplacer(delim, " ", "\r", " ", "\n", " ")
 	d.names = make([]string, len(defs))
 	d.fns = make([]fieldFn, len(defs))
 	for i, def := range defs {
@@ -51,11 +53,19 @@ func newDSV(fc *FieldComputer, defs []fieldDef, delim, header string, sortNames 
 
 // Prepare computes the field values, the output line and the sort keys.
 func (d *DSV) Prepare(ev *container.Event) *Unit {
-	raw := make([]string, len(d.fns))
 	san := make([]string, len(d.fns))
+	// Raw values are retained only by the jsonl renderer and l2tcsv's MACB
+	// collapse; otherwise they are transient and need not be kept.
+	var raw []string
+	if d.jsonl || d.collapse {
+		raw = make([]string, len(d.fns))
+	}
 	for i, fn := range d.fns {
-		raw[i] = fn(d.fc, ev)
-		san[i] = sanitizeDSV(raw[i], d.delim)
+		v := fn(d.fc, ev)
+		if raw != nil {
+			raw[i] = v
+		}
+		san[i] = sanitizeDSV(v, d.folder)
 	}
 
 	u := &Unit{
@@ -66,19 +76,39 @@ func (d *DSV) Prepare(ev *container.Event) *Unit {
 	if d.jsonl {
 		u.Line = jsonlObject(d.names, raw)
 	} else {
-		u.Line = strings.Join(san, d.delim) + "\n"
+		// Equivalent to strings.Join(san, d.delim) + "\n", assembled into one
+		// pre-sized buffer (no intermediate Join allocation).
+		total := 1 + len(d.delim)*(len(san)-1)
+		for _, s := range san {
+			total += len(s)
+		}
+		var b strings.Builder
+		b.Grow(total)
+		for i, s := range san {
+			if i > 0 {
+				b.WriteString(d.delim)
+			}
+			b.WriteString(s)
+		}
+		b.WriteByte('\n')
+		u.Line = b.String()
 	}
 
-	parts := make([]string, len(d.sortIdx))
+	// SortKey = " ".join(san[idx]) over the sort fields; PrimaryKey = the first.
+	var sb strings.Builder
 	for i, idx := range d.sortIdx {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
 		if idx >= 0 {
-			parts[i] = san[idx]
+			sb.WriteString(san[idx])
 		}
 	}
-	u.SortKey = strings.Join(parts, " ")
-	if len(parts) > 0 {
-		u.PrimaryKey = parts[0]
+	u.SortKey = sb.String()
+	if len(d.sortIdx) > 0 && d.sortIdx[0] >= 0 {
+		u.PrimaryKey = san[d.sortIdx[0]]
 	}
+
 	if d.collapse {
 		u.Fields = &DSVFields{names: d.names, raw: raw}
 	}
@@ -115,7 +145,7 @@ func (d *DSV) collapseGroup(members []*Unit) *Unit {
 		default:
 			raw = first[i]
 		}
-		san[i] = sanitizeDSV(raw, d.delim)
+		san[i] = sanitizeDSV(raw, d.folder)
 	}
 	return &Unit{Line: strings.Join(san, d.delim) + "\n"}
 }

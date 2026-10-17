@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -121,6 +122,12 @@ type EventDataStream struct {
 	SHA256Hash  string
 	FileEntropy string
 	YaraMatch   string
+
+	// ParsedPathSpec caches the decoded PathSpec, parsed once by the reader when
+	// the stream is loaded (before any worker goroutine exists) and shared
+	// read-only across workers. Typed as any to avoid a container→dfpath import
+	// cycle; it holds a *dfpath.PathSpec (nil when PathSpec is empty).
+	ParsedPathSpec any
 }
 
 // DateTimeValues is a decoded dfdatetime value. ClassName discriminates the
@@ -177,7 +184,15 @@ func toInt(v any) int {
 // so large integers (e.g. nanosecond timestamps exceeding 2^53) keep full
 // precision instead of being coerced to float64.
 func DecodeJSONObject(data []byte) (map[string]any, error) {
-	dec := gojson.NewDecoder(bytes.NewReader(data))
+	return DecodeJSONObjectFrom(bytes.NewReader(data))
+}
+
+// DecodeJSONObjectFrom decodes a JSON object directly from a reader (json.Number
+// preserved). Decoding straight from the zlib stream avoids buffering the whole
+// decompressed blob a second time (the decoder keeps its own read buffer), which
+// removed the io.ReadAll allocation from the per-event decode hot path.
+func DecodeJSONObjectFrom(r io.Reader) (map[string]any, error) {
+	dec := gojson.NewDecoder(r)
 	dec.UseNumber()
 	var m map[string]any
 	if err := dec.Decode(&m); err != nil {

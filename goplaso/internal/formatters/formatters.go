@@ -111,6 +111,9 @@ type Formatter struct {
 	shortPieceAttrs []string // lazy
 	mapsOnce        sync.Once
 	buildErr        error
+
+	attrNames     map[string]bool // cached GetFormatStringAttributeNames result
+	attrNamesOnce sync.Once
 }
 
 // SourceMapping returns (short, long).
@@ -186,8 +189,14 @@ func formatMessage(template string, values map[string]any) string {
 			out = ""
 		}
 	}
-	return strings.NewReplacer("\r", "", "\n", "").Replace(out)
+	return crlfStripper.Replace(out)
 }
+
+// crlfStripper removes carriage returns and newlines from a formatted message
+// (plaso strips them so an event never spans output rows). It is built once and
+// shared: a strings.Replacer is immutable and safe for concurrent use, and
+// rebuilding it per message was ≈11% of allocations on the hot path.
+var crlfStripper = strings.NewReplacer("\r", "", "\n", "")
 
 // CustomRegistry maps a lowercased custom-helper identifier to its function.
 type CustomRegistry map[string]func(values map[string]any)

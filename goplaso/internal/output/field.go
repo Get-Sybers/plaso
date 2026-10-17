@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Get-Sybers/plaso/goplaso/internal/container"
-	"github.com/Get-Sybers/plaso/goplaso/internal/dfpath"
 	"github.com/Get-Sybers/plaso/goplaso/internal/dftime"
 	"github.com/Get-Sybers/plaso/goplaso/internal/formatters"
 	"github.com/Get-Sybers/plaso/goplaso/internal/mediator"
@@ -192,8 +191,8 @@ func (c *FieldComputer) displayName(ev *container.Event) string {
 		if dn := ed.StringAttr("display_name"); dn != "" {
 			return dn
 		}
-		if ed.Stream != nil && ed.Stream.PathSpec != "" {
-			if ps, err := dfpath.Parse(ed.Stream.PathSpec); err == nil && ps != nil {
+		if ed.Stream != nil {
+			if ps := streamPathSpec(ed.Stream); ps != nil {
 				return ps.DisplayName()
 			}
 		}
