@@ -466,6 +466,37 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             order_by="timestamp",
         )
 
+    def Open(self, **kwargs):  # pylint: disable=arguments-differ
+        """Opens the store.
+
+        Args:
+          path (Optional[str]): path to the attribute container store.
+          read_only (Optional[bool]): True if the file should be opened in
+              read-only mode.
+
+        Raises:
+          OSError: if the store is already opened or cannot be connected.
+        """
+        super().Open(**kwargs)
+
+        # The base class only sets the journal_mode and synchronous PRAGMAs,
+        # which are write/durability knobs that have no effect on a read-only
+        # (?mode=ro) connection. On the psort read path the dominant costs are
+        # the random event_data lookups and any transient sort, so enlarge the
+        # page cache, memory-map the store and keep temporary results in memory.
+        # These are applied only to read-only connections to avoid multiplying
+        # memory use across the many writable per-task stores opened during
+        # extraction. They are performance-only and do not change query results.
+        if self._read_only:
+            try:
+                self._connection.execute("PRAGMA temp_store = MEMORY")
+                self._connection.execute("PRAGMA cache_size = -131072")
+                self._connection.execute("PRAGMA mmap_size = 1073741824")
+            except (sqlite3.InterfaceError, sqlite3.OperationalError):
+                # The PRAGMAs are an optimization; a failure to apply them must
+                # not prevent the store from being read.
+                pass
+
     def SetSerializersProfiler(self, serializers_profiler):
         """Sets the serializers profiler.
 
