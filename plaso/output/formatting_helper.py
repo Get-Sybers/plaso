@@ -153,9 +153,7 @@ class FieldFormattingHelper:
                 datetime_object = datetime.datetime(
                     year, month, day_of_month, hours, minutes, seconds
                 )
-                self._time_zone_name = output_mediator.time_zone.tzname(
-                    datetime_object
-                )
+                self._time_zone_name = output_mediator.time_zone.tzname(datetime_object)
             except (OverflowError, TypeError, ValueError):
                 self._time_zone_name = self._TIME_ZONE_NAME_ERROR
 

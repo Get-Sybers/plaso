@@ -505,7 +505,9 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             order_by="timestamp",
         )
 
-    def Open(self, **kwargs):  # pylint: disable=arguments-differ
+    def Open(
+        self, path=None, read_only=True, **kwargs
+    ):  # pylint: disable=arguments-differ
         """Opens the store.
 
         Args:
@@ -516,7 +518,7 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
         Raises:
           OSError: if the store is already opened or cannot be connected.
         """
-        super().Open(**kwargs)
+        super().Open(path=path, read_only=read_only, **kwargs)
 
         # The base class only sets the journal_mode and synchronous PRAGMAs,
         # which are write/durability knobs that have no effect on a read-only

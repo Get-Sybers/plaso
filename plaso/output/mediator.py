@@ -331,9 +331,7 @@ class OutputMediator:
         """
         # Cache the resolution per data type so the lowercasing and dictionary
         # lookup run once per distinct data type instead of once per event.
-        message_formatter = self._message_formatter_by_data_type.get(
-            data_type, False
-        )
+        message_formatter = self._message_formatter_by_data_type.get(data_type, False)
         if message_formatter is False:
             message_formatter = self._message_formatters.get(data_type.lower())
             self._message_formatter_by_data_type[data_type] = message_formatter
@@ -365,9 +363,7 @@ class OutputMediator:
         # lookup run once per distinct data type instead of once per event.
         source_mapping = self._source_mapping_by_data_type.get(data_type)
         if source_mapping is None:
-            source_mapping = self._source_mappings.get(
-                data_type.lower(), (None, None)
-            )
+            source_mapping = self._source_mappings.get(data_type.lower(), (None, None))
             self._source_mapping_by_data_type[data_type] = source_mapping
 
         return source_mapping
