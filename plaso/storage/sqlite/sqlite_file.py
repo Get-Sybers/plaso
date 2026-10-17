@@ -138,6 +138,21 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
                 raise OSError(f"Unable to query storage file with error: {exception!s}")
 
+        elif container_type == self._CONTAINER_TYPE_EVENT:
+            # Index the event table on timestamp so that GetSortedEvents can read
+            # events in chronological order using an ordered index scan instead of
+            # a full external sort. The index covers the columns projected by the
+            # sorted read, except the (large) date_time value, so the sort and the
+            # pre-first-row stall are removed while the index stays compact.
+            query = (
+                "CREATE INDEX event_per_timestamp ON event "
+                "(timestamp, _identifier, _event_data_identifier, timestamp_desc)"
+            )
+            try:
+                self._cursor.execute(query)
+            except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
+                raise OSError(f"Unable to query storage file with error: {exception!s}")
+
     def _DeserializeAttributeContainer(self, container_type, serialized_data):
         """Deserializes an attribute container.
 
