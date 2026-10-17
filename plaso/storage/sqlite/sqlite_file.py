@@ -370,12 +370,13 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
 
         row_number = index + 1
         column_names = ", ".join(column_names)
-        query = (
-            f"SELECT {column_names:s} FROM {container_type:s} "
-            f"WHERE rowid = {row_number:d}"
-        )
+        # Bind the rowid as a parameter instead of interpolating it so the SQL
+        # text is identical on every lookup and SQLite reuses the prepared
+        # statement from its cache rather than re-parsing and re-planning per
+        # event.
+        query = f"SELECT {column_names:s} FROM {container_type:s} WHERE rowid = ?"
         try:
-            self._cursor.execute(query)
+            self._cursor.execute(query, (row_number,))
         except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
             raise OSError(f"Unable to query storage file with error: {exception!s}")
 
