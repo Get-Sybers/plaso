@@ -91,6 +91,13 @@ The real levers, all within the SQLite format, applied here:
   the parallel speedup.
 - **`goccy/go-json`** for the blob JSON (~2.4× faster than `encoding/json`,
   drop-in, preserves `json.Number` precision for nanosecond timestamps).
+- **Pooled zlib readers + decode straight from the inflate stream.** Each
+  `zlib.NewReader` allocates a fresh ~32 KiB flate window; recycling the readers
+  (`sync.Pool` + `Resetter.Reset`) and decoding the JSON directly off the stream
+  (instead of `io.ReadAll` into a second full buffer) cut per-event allocation
+  ~80% (≈9.4→1.8 GB over a 155k-event run) and GC pressure with it — a further
+  ~1.6× on the parallel hot path, with byte-identical output. GC was the
+  cross-worker bottleneck, so cutting allocations helps parallel most.
 
 ## Package layout
 
