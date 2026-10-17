@@ -338,6 +338,11 @@ class WinevtResourcesHelper:
 
     _WINEVT_RC_DATABASE = "winevt-rc.db"
 
+    # Sentinel cached to record that a message string could not be resolved, so
+    # the (unindexed) lookup is performed at most once per key instead of being
+    # repeated for every event of a provider whose resources are absent.
+    _NO_MESSAGE_STRING = object()
+
     def __init__(self, storage_reader, data_location, lcid):
         """Initializes Windows EventLog resources helper.
 
@@ -412,27 +417,30 @@ class WinevtResourcesHelper:
           event_version (int): event version or None if not set.
 
         Returns:
-          str: message string or None if not available.
+          object: message string if a positive result is cached, the
+              _NO_MESSAGE_STRING sentinel if a negative result is cached, or
+              None if no result is cached.
         """
-        lookup_key = None
-        message_string = None
-
+        lookup_keys = []
         if provider_identifier:
             lookup_key = f"{provider_identifier:s}:0x{message_identifier:08x}"
             if event_version is not None:
                 lookup_key = f"{lookup_key:s}:{event_version:d}"
-            message_string = self._message_string_cache.get(lookup_key)
+            lookup_keys.append(lookup_key)
 
-        if not message_string and log_source:
+        if log_source:
             lookup_key = f"{log_source:s}:0x{message_identifier:08x}"
             if event_version is not None:
                 lookup_key = f"{lookup_key:s}:{event_version:d}"
+            lookup_keys.append(lookup_key)
+
+        for lookup_key in lookup_keys:
             message_string = self._message_string_cache.get(lookup_key)
+            if message_string is not None:
+                self._message_string_cache.move_to_end(lookup_key, last=False)
+                return message_string
 
-        if message_string:
-            self._message_string_cache.move_to_end(lookup_key, last=False)
-
-        return message_string
+        return None
 
     def _GetEventMessageFileIdentifiers(self, message_files):
         """Retrieves event message file identifiers.
@@ -981,7 +989,7 @@ class WinevtResourcesHelper:
         message_string = self._GetCachedMessageString(
             provider_identifier, log_source, message_identifier, event_version
         )
-        if not message_string:
+        if message_string is None:
             if self._storage_reader:
                 message_string = self._ReadEventMessageString(
                     self._storage_reader,
@@ -995,14 +1003,18 @@ class WinevtResourcesHelper:
                     provider_identifier, log_source, message_identifier, event_version
                 )
 
-            if message_string:
-                self._CacheMessageString(
-                    provider_identifier,
-                    log_source,
-                    message_identifier,
-                    event_version,
-                    message_string,
-                )
+            # Cache the result, including a negative result as a sentinel, so an
+            # unresolved provider or message identifier is not looked up again.
+            self._CacheMessageString(
+                provider_identifier,
+                log_source,
+                message_identifier,
+                event_version,
+                message_string or self._NO_MESSAGE_STRING,
+            )
+
+        if message_string is self._NO_MESSAGE_STRING:
+            message_string = None
 
         return message_string
 
@@ -1020,7 +1032,7 @@ class WinevtResourcesHelper:
         message_string = self._GetCachedMessageString(
             provider_identifier, log_source, message_identifier, None
         )
-        if not message_string:
+        if message_string is None:
             if self._storage_reader:
                 message_string = self._ReadParameterMessageString(
                     self._storage_reader,
@@ -1035,13 +1047,17 @@ class WinevtResourcesHelper:
                     message_identifier,
                 )
 
-            if message_string:
-                self._CacheMessageString(
-                    provider_identifier,
-                    log_source,
-                    message_identifier,
-                    None,
-                    message_string,
-                )
+            # Cache the result, including a negative result as a sentinel, so an
+            # unresolved provider or message identifier is not looked up again.
+            self._CacheMessageString(
+                provider_identifier,
+                log_source,
+                message_identifier,
+                None,
+                message_string or self._NO_MESSAGE_STRING,
+            )
+
+        if message_string is self._NO_MESSAGE_STRING:
+            message_string = None
 
         return message_string
