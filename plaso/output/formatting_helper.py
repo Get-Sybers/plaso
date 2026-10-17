@@ -52,6 +52,16 @@ class FieldFormattingHelper:
         self._event_data_stream_field_names = event_data_stream.GetAttributeNames()
         self._event_tag_field_names = []
 
+        # Per-event cache of the resolved message formatter and the formatted
+        # event values, keyed by identity of the event data. The message and
+        # short message fields (and derived fields) are formatted from the same
+        # event data within a single GetFieldValues call, so this lets the
+        # CopyToDict and FormatEventValues passes run once per event instead of
+        # once per message-bearing field.
+        self._cached_event_data = None
+        self._cached_message_formatter = None
+        self._cached_message_event_values = None
+
         for field_name, callback_name in self._FIELD_FORMAT_CALLBACKS.items():
             if callback_name == "_FormatTag":
                 self._event_tag_field_names.append(field_name)
@@ -308,6 +318,44 @@ class FieldFormattingHelper:
         """
         return output_mediator.GetMACBRepresentation(event, event_data)
 
+    def _GetMessageFormatterAndEventValues(self, output_mediator, event_data):
+        """Retrieves the message formatter and formatted event values.
+
+        The resolved message formatter and the formatted event values are a
+        pure function of the event data, so they are cached and reused while
+        the same event data is being formatted. This avoids repeating the
+        CopyToDict and FormatEventValues passes for the message and short
+        message fields of the same event.
+
+        Args:
+          output_mediator (OutputMediator): mediates interactions between output
+              modules and other components, such as storage and dfVFS.
+          event_data (EventData): event data.
+
+        Returns:
+          tuple[EventFormatter, dict[str, object]]: message formatter and
+              formatted event values.
+        """
+        if event_data is not self._cached_event_data:
+            message_formatter = output_mediator.GetMessageFormatter(
+                event_data.data_type
+            )
+            if not message_formatter:
+                logger.warning(
+                    f"Using default message formatter for data type: "
+                    f"{event_data.data_type:s}"
+                )
+                message_formatter = self._DEFAULT_MESSAGE_FORMATTER
+
+            event_values = event_data.CopyToDict()
+            message_formatter.FormatEventValues(output_mediator, event_values)
+
+            self._cached_event_data = event_data
+            self._cached_message_formatter = message_formatter
+            self._cached_message_event_values = event_values
+
+        return self._cached_message_formatter, self._cached_message_event_values
+
     def _FormatMessage(self, output_mediator, event, event_data, event_data_stream):
         """Formats a message field.
 
@@ -321,17 +369,9 @@ class FieldFormattingHelper:
         Returns:
           str: message field.
         """
-        message_formatter = output_mediator.GetMessageFormatter(event_data.data_type)
-        if not message_formatter:
-            logger.warning(
-                f"Using default message formatter for data type: "
-                f"{event_data.data_type:s}"
-            )
-            message_formatter = self._DEFAULT_MESSAGE_FORMATTER
-
-        event_values = event_data.CopyToDict()
-        message_formatter.FormatEventValues(output_mediator, event_values)
-
+        message_formatter, event_values = self._GetMessageFormatterAndEventValues(
+            output_mediator, event_data
+        )
         return message_formatter.GetMessage(event_values)
 
     def _FormatMessageShort(
@@ -349,17 +389,9 @@ class FieldFormattingHelper:
         Returns:
           str: short message field.
         """
-        message_formatter = output_mediator.GetMessageFormatter(event_data.data_type)
-        if not message_formatter:
-            logger.warning(
-                f"Using default message formatter for data type: "
-                f"{event_data.data_type:s}"
-            )
-            message_formatter = self._DEFAULT_MESSAGE_FORMATTER
-
-        event_values = event_data.CopyToDict()
-        message_formatter.FormatEventValues(output_mediator, event_values)
-
+        message_formatter, event_values = self._GetMessageFormatterAndEventValues(
+            output_mediator, event_data
+        )
         return message_formatter.GetMessageShort(event_values)
 
     def _FormatParser(self, output_mediator, event, event_data, event_data_stream):
