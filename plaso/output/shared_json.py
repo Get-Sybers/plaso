@@ -109,11 +109,49 @@ class SharedJSONOutputModule(text_file.TextFileOutputModule):
 
     _JSON_SERIALIZER = json_serializer.JSONAttributeContainerSerializer
 
+    # The maximum number of serialized path specifications to cache.
+    _MAXIMUM_CACHED_PATH_SPECS = 32 * 1024
+
     def __init__(self):
         """Initializes an output module."""
         super().__init__()
         self._field_formatting_helper = JSONFieldFormattingHelper()
         self._generated_field_values = None
+        self._serialized_path_spec_cache = {}
+
+    def _GetSerializedPathSpec(self, event_data_stream, path_spec):
+        """Serializes a path specification, memoized per event data stream.
+
+        The path specification of an event data stream is identical for every
+        event that shares that stream (typically many consecutive events from
+        the same source), and serializing it is a nested parent-chain walk.
+        Cache the serialized result per event data stream so it is produced
+        once per stream instead of once per event. The serialized dictionary is
+        only read (json.dumps) afterwards, so sharing it across events is safe.
+
+        Args:
+          event_data_stream (EventDataStream): event data stream.
+          path_spec (dfvfs.PathSpec): path specification to serialize.
+
+        Returns:
+          dict[str, object]: serialized path specification.
+        """
+        identifier = event_data_stream.GetIdentifier()
+        lookup_key = identifier.sequence_number if identifier else None
+
+        if lookup_key is not None:
+            serialized_path_spec = self._serialized_path_spec_cache.get(lookup_key)
+            if serialized_path_spec is not None:
+                return serialized_path_spec
+
+        serialized_path_spec = self._JSON_SERIALIZER.WriteSerializedDict(path_spec)
+
+        if lookup_key is not None and (
+            len(self._serialized_path_spec_cache) < self._MAXIMUM_CACHED_PATH_SPECS
+        ):
+            self._serialized_path_spec_cache[lookup_key] = serialized_path_spec
+
+        return serialized_path_spec
 
     def GetFieldValues(
         self, output_mediator, event, event_data, event_data_stream, event_tag
@@ -182,8 +220,8 @@ class SharedJSONOutputModule(text_file.TextFileOutputModule):
                 # Output path_spec as pathspec for backwards compatibility.
                 if attribute_name == "path_spec":
                     attribute_name = "pathspec"
-                    attribute_value = self._JSON_SERIALIZER.WriteSerializedDict(
-                        attribute_value
+                    attribute_value = self._GetSerializedPathSpec(
+                        event_data_stream, attribute_value
                     )
 
                 field_values[attribute_name] = attribute_value
