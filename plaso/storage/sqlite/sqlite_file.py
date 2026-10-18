@@ -138,6 +138,59 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
                 raise OSError(f"Unable to query storage file with error: {exception!s}")
 
+        elif container_type == self._CONTAINER_TYPE_EVENT:
+            # Index the event table on timestamp so that GetSortedEvents can read
+            # events in chronological order using an ordered index scan instead of
+            # a full external sort. The index covers the columns projected by the
+            # sorted read, except the (large) date_time value, so the sort and the
+            # pre-first-row stall are removed while the index stays compact.
+            query = (
+                "CREATE INDEX event_per_timestamp ON event "
+                "(timestamp, _identifier, _event_data_identifier, timestamp_desc)"
+            )
+            try:
+                self._cursor.execute(query)
+            except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
+                raise OSError(f"Unable to query storage file with error: {exception!s}")
+
+    def _CacheAttributeContainerByIndex(self, attribute_container, index):
+        """Caches a specific attribute container.
+
+        Overrides the base implementation to key the read cache by a
+        (container_type, index) tuple instead of formatting a
+        "<container_type>.<index>" string on every cache insertion.
+
+        Args:
+          attribute_container (AttributeContainer): attribute container.
+          index (int): attribute container index.
+        """
+        if len(self._attribute_container_cache) >= self._MAXIMUM_CACHED_CONTAINERS:
+            self._attribute_container_cache.popitem(last=True)
+
+        lookup_key = (attribute_container.CONTAINER_TYPE, index)
+        self._attribute_container_cache[lookup_key] = attribute_container
+        self._attribute_container_cache.move_to_end(lookup_key, last=False)
+
+    def _GetCachedAttributeContainer(self, container_type, index):
+        """Retrieves a specific cached attribute container.
+
+        Overrides the base implementation to key the read cache by a
+        (container_type, index) tuple instead of formatting a
+        "<container_type>.<index>" string on every lookup.
+
+        Args:
+          container_type (str): attribute container type.
+          index (int): attribute container index.
+
+        Returns:
+          AttributeContainer: attribute container or None if not available.
+        """
+        lookup_key = (container_type, index)
+        attribute_container = self._attribute_container_cache.get(lookup_key)
+        if attribute_container:
+            self._attribute_container_cache.move_to_end(lookup_key, last=False)
+        return attribute_container
+
     def _DeserializeAttributeContainer(self, container_type, serialized_data):
         """Deserializes an attribute container.
 
@@ -355,12 +408,13 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
 
         row_number = index + 1
         column_names = ", ".join(column_names)
-        query = (
-            f"SELECT {column_names:s} FROM {container_type:s} "
-            f"WHERE rowid = {row_number:d}"
-        )
+        # Bind the rowid as a parameter instead of interpolating it so the SQL
+        # text is identical on every lookup and SQLite reuses the prepared
+        # statement from its cache rather than re-parsing and re-planning per
+        # event.
+        query = f"SELECT {column_names:s} FROM {container_type:s} WHERE rowid = ?"
         try:
-            self._cursor.execute(query)
+            self._cursor.execute(query, (row_number,))
         except (sqlite3.InterfaceError, sqlite3.OperationalError) as exception:
             raise OSError(f"Unable to query storage file with error: {exception!s}")
 
@@ -450,6 +504,39 @@ class SQLiteStorageFile(sqlite_store.SQLiteAttributeContainerStore):
             filter_expression=filter_expression,
             order_by="timestamp",
         )
+
+    def Open(
+        self, path=None, read_only=True, **kwargs
+    ):  # pylint: disable=arguments-differ
+        """Opens the store.
+
+        Args:
+          path (Optional[str]): path to the attribute container store.
+          read_only (Optional[bool]): True if the file should be opened in
+              read-only mode.
+
+        Raises:
+          OSError: if the store is already opened or cannot be connected.
+        """
+        super().Open(path=path, read_only=read_only, **kwargs)
+
+        # The base class only sets the journal_mode and synchronous PRAGMAs,
+        # which are write/durability knobs that have no effect on a read-only
+        # (?mode=ro) connection. On the psort read path the dominant costs are
+        # the random event_data lookups and any transient sort, so enlarge the
+        # page cache, memory-map the store and keep temporary results in memory.
+        # These are applied only to read-only connections to avoid multiplying
+        # memory use across the many writable per-task stores opened during
+        # extraction. They are performance-only and do not change query results.
+        if self._read_only:
+            try:
+                self._connection.execute("PRAGMA temp_store = MEMORY")
+                self._connection.execute("PRAGMA cache_size = -131072")
+                self._connection.execute("PRAGMA mmap_size = 1073741824")
+            except (sqlite3.InterfaceError, sqlite3.OperationalError):
+                # The PRAGMAs are an optimization; a failure to apply them must
+                # not prevent the store from being read.
+                pass
 
     def SetSerializersProfiler(self, serializers_profiler):
         """Sets the serializers profiler.
